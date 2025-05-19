@@ -8,15 +8,18 @@ def preprocess(image):
     return image_resized
 
 def preprocess_for_ocr(image_np):
-    # Pastikan gambar dalam grayscale
-    if len(image_np.shape) == 3:
-        image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
+    # Ubah ke grayscale
+    gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
 
-    # Equalize lighting
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(image_np)
+    # Denoising
+    denoised = cv2.fastNlMeansDenoising(gray, h=8)
 
-    # Blur untuk meredam noise
-    blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    # Adaptive threshold
+    thresh = cv2.adaptiveThreshold(
+        denoised, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        9, 3
+    )
 
-    return blurred
+    return thresh
