@@ -1,14 +1,12 @@
 import cv2
 import numpy as np
 
-#tambah gaussian filter
 def preprocess(image):
     image_np = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     image_resized = cv2.resize(image_np, (640, 640))
     return image_resized
 
 def preprocess_for_ocr(image_np):
-    # Ubah ke grayscale
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
 
     # Denoising
