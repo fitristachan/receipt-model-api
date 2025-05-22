@@ -286,7 +286,7 @@ def crop_image_by_bbox(image: np.ndarray, bbox: list) -> np.ndarray:
     else:
         raise ValueError("Format bbox tidak valid.")
 
-def read_image(image):
+def read_image(image, ocr):
     preprocessed = preprocess(image)
     boxes, classes = process_model(preprocessed)
 

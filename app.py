@@ -24,7 +24,7 @@ def predict():
         image_np = np.array(image)
 
         # Memproses gambar dengan fungsi read_image
-        result = read_image(image_np)
+        result = read_image(image_np, ocr)
 
         return jsonify(result), 200
     except Exception as e:
