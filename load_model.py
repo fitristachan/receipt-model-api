@@ -1,7 +1,6 @@
 from ultralytics import YOLO
 import re
 from typing import List, Dict, Union
-import easyocr
 import numpy as np
 import cv2
 import os
@@ -119,6 +118,9 @@ def detect_class(lines: List[str]) -> List[Dict]:
     return processed_results
 
 
+import re
+from typing import List, Dict, Union
+
 def reconstruct_items(ner_results: List[Dict]) -> List[Dict]:
     reconstructed = []
     current_item = []
@@ -193,36 +195,73 @@ def is_noise(text: str) -> bool:
     """
     noise_keywords = [
         'subtotal', 'sub total', 'service', 'tax', 'pajak', 'pb1', 't0tal', 'subt0tal',
-        'r0unding','disk0n','disc0unt',
+        'r0unding','disk0n','disc0unt', 'vc', 'vc pt'
         'rounding', 'diskon', 'discount', 'total', 'grand total', 'change', 'kembalian', 'srand tl'
     ]
     text = text.lower()
     return any(keyword in text for keyword in noise_keywords)
 
 
+def is_short_or_symbol(text: str, min_length=3) -> bool:
+    """Check if text is too short or just symbols/numbers."""
+    stripped = text.strip()
+    # Skip if:
+    # - Length < min_length (default: 3)
+    # - Only digits/symbols (e.g., "1", "A", ",M")
+    return (
+        len(stripped) < min_length or
+        stripped.isdigit() or
+        (len(stripped) == 1 and not stripped.isalpha())
+    )
+
+
+def clean_item_name(name: str) -> str:
+    # Hapus karakter non-alfanumerik di awal dan akhir (selain huruf dan angka)
+    return re.sub(r"^[^\w\d]+|[^\w\d]+$", "", name.strip())
+
 def process_receipt_data_with_ner(ner_results: List[Dict]) -> Dict:
-    """Pipeline utama dengan NER"""
-    # 1. Rekonstruksi item multi-kata
+    """Process receipt data with discount handling."""
     reconstructed = reconstruct_items(ner_results)
-    
-    # 2. Pasangkan item dengan price
     paired = pair_entities(reconstructed)
     
-    # 3. Filter hasil
-    valid_items = [
-        item for item in paired 
-        if item['item_name'] and item['price'] and not is_noise(item['item_name'])
-    ]
+    valid_items = []
+    discount_keywords = {"uc", "vc", "vc pt", "disc", "voucher", "diskon", "discount"}  # Keywords that indicate discounts
+    
+    i = 0
+    n = len(paired)
+    
+    while i < n:
+        current_item = paired[i]
+        
+        # Bersihkan item name
+        current_item['item_name'] = clean_item_name(current_item['item_name'])
+        
+        
+        # Skip if invalid
+        if not current_item['item_name'] or not current_item['price'] or is_noise(current_item['item_name']) or is_short_or_symbol(current_item['item_name']):
+            i += 1
+            continue
+
+        # Check if the NEXT item is a discount
+        if i + 1 < n:
+            next_item = paired[i + 1]
+            next_text = next_item['item_name'].lower()
+            
+            # If next item is a discount, subtract its price
+            if any(keyword in next_text for keyword in discount_keywords):
+                current_item['price'] -= next_item['price']
+                i += 1  # Skip the discount item
+                
+        valid_items.append(current_item)
+        i += 1
     
     return {
         'status': 'success',
         'items': valid_items
     }
 
-
-# Inisialisasi
+# Inisialisasi OCR
 keywords = ['total', 'subtotal', 'amount', 'jumlah', 't0tal', 'subt0tal']
-reader = easyocr.Reader(['en', 'id']) 
 
 def crop_image_by_bbox(image: np.ndarray, bbox: list) -> np.ndarray:
     height, width = image.shape[:2]
@@ -247,47 +286,56 @@ def crop_image_by_bbox(image: np.ndarray, bbox: list) -> np.ndarray:
     else:
         raise ValueError("Format bbox tidak valid.")
 
-    
 def read_image(image):
     preprocessed = preprocess(image)
-
     boxes, classes = process_model(preprocessed)
 
     print("Langsung cek keyword dari OCR global...")
 
     preprocessed_ocr = preprocess_for_ocr(preprocessed)
-    ocr_result = reader.readtext(preprocessed_ocr)
-    detected_lines = [text for _, text, _ in ocr_result]
-    detected_text_lower = " ".join([t.lower() for t in detected_lines])
-    # print(f"cek keyword: {detected_text_lower}")
 
-    # Cek apakah ada keyword di teks hasil OCR
+    # Gunakan OCR global
+    ocr_result = ocr.predict(preprocessed_ocr)
+    
+    # If ocr_result is a list containing one dict
+    if isinstance(ocr_result, list) and len(ocr_result) > 0:
+        ocr_result = ocr_result[0]
+    
+    # Now access rec_texts
+    detected_lines = ocr_result['rec_texts']
+    # print(f"detected_lines: {detected_lines}")
+    detected_text_lower = " ".join([t.lower() for t in detected_lines if t.strip()])
+    print(f"detected_text_lower: {detected_text_lower}")
+    
     if any(keyword in detected_text_lower for keyword in keywords):
         print("Keyword ditemukan. Proses ekstraksi data receipt...")
 
-        #OCR berdasarkan bbox dari hasil deteksi model
+        # OCR berdasarkan bbox dari hasil deteksi model
         detected_lines = []
-        
+
         for idx, bbox in enumerate(boxes):
             try:
                 cropped_image = crop_image_by_bbox(preprocessed_ocr, bbox)
-                ocr_result = reader.readtext(cropped_image)
-        
-                # Ambil teks saja dari hasil OCR
-                detected_lines.extend([text for _, text, _ in ocr_result])
-        
+                ocr_result = ocr.predict(cropped_image)
+                if ocr_result and isinstance(ocr_result, list) and len(ocr_result) > 0:
+                    ocr_result = ocr_result[0]  # Get the first (and usually only) result dict
+                    
+                    # Extract text line by line
+                    for text in ocr_result['rec_texts']:
+                        if text.strip():  # Skip empty lines
+                            detected_lines.append(text) 
+
             except ValueError as e:
                 print(f"Error dalam cropping gambar: {e}")
                 continue
 
         detected_text_lower = " ".join([t.lower() for t in detected_lines])
         print(detected_text_lower)
-        
+
         lines = split_detected_text(detected_text_lower)
         ner_results = detect_class(lines)
         final_result = process_receipt_data_with_ner(ner_results)
-        
-        # Output
+
         print("SPLIT lines:", lines)
         print("NER results:", ner_results)
         print("FINAL:", final_result)

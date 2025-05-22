@@ -2,5 +2,5 @@ Flask
 numpy
 opencv-python
 ultralytics
-easyocr
 pillow
+paddleocr==3.0.0

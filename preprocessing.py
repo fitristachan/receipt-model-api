@@ -7,6 +7,7 @@ def preprocess(image):
     return image_resized
 
 def preprocess_for_ocr(image_np):
+    # Ubah ke grayscale
     gray = cv2.cvtColor(image_np, cv2.COLOR_BGR2GRAY)
 
     # Denoising
@@ -20,4 +21,6 @@ def preprocess_for_ocr(image_np):
         9, 3
     )
 
-    return thresh
+    result = cv2.cvtColor(thresh, cv2.COLOR_GRAY2RGB)
+
+    return result

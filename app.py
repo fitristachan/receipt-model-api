@@ -3,8 +3,11 @@ from PIL import Image
 import numpy as np
 from io import BytesIO
 from load_model import read_image
+from paddleocr import PaddleOCR
 
 app = Flask(__name__)
+
+ocr = PaddleOCR(use_textline_orientation=True, lang='en')
 
 @app.route('/predict', methods=['POST'])
 def predict():
