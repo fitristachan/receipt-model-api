@@ -1,6 +1,6 @@
 from ultralytics import YOLO
 import re
-from typing import List, Dict, Union
+from typing import List, Dict, Union, Any
 import numpy as np
 import cv2
 import os
@@ -118,9 +118,6 @@ def detect_class(lines: List[str]) -> List[Dict]:
     return processed_results
 
 
-import re
-from typing import List, Dict, Union
-
 def reconstruct_items(ner_results: List[Dict]) -> List[Dict]:
     reconstructed = []
     current_item = []
@@ -214,49 +211,156 @@ def is_short_or_symbol(text: str, min_length=3) -> bool:
         (len(stripped) == 1 and not stripped.isalpha())
     )
 
+def normalize_price_typo(text: str) -> str:
+    typo_map = {
+        'b': '8',
+        'B': '8',
+        'o': '0',
+        'O': '0',
+        'l': '1',
+        'I': '1',
+        'i': '1',
+        's': '5',
+        'S': '5',
+        'z': '2',
+        'Z': '2',
+    }
+    return ''.join(typo_map.get(c, c) for c in text)
+
+
+def extract_tax_lines_with_context(rec_texts, tax_keywords=None):
+    if tax_keywords is None:
+        tax_keywords = ["ppn", "pajak", "tax", "pjk", "service", "serv", "pb", "charge", "chrg"]
+
+    tax_lines = []
+    tax_amounts = []
+
+    n = len(rec_texts)
+
+    for i, line in enumerate(rec_texts):
+        lower_line = line.lower()
+
+        if any(k in lower_line for k in tax_keywords):
+            tax_lines.append(line)
+            found = False
+
+            # ✅ Cari angka yang terkait keyword di baris ini
+            matches = extract_tax_values_from_line_by_keyword(line, tax_keywords)
+            tax_amounts.extend(matches)
+            found = bool(matches)
+
+            # Kalau belum ketemu, cek baris setelah
+            if not found and i + 1 < n:
+                next_line = rec_texts[i + 1]
+                amount = extract_price_like_from_line(next_line)
+                if amount is not None:
+                    tax_amounts.append(amount)
+                    tax_lines.append(next_line)
+                    found = True
+
+            # Kalau masih belum, cek baris sebelum
+            if not found and i - 1 >= 0:
+                prev_line = rec_texts[i - 1]
+                amount = extract_price_like_from_line(prev_line)
+                if amount is not None:
+                    tax_amounts.append(amount)
+                    tax_lines.append(prev_line)
+
+    return tax_lines, tax_amounts
+
+
+def extract_tax_values_from_line_by_keyword(line, tax_keywords):
+    tax_amounts = []
+    lower_line = line.lower()
+
+    for keyword in tax_keywords:
+        pattern = rf"{keyword}\s*[:=]?\s*([\d.,]+)"
+        matches = re.findall(pattern, lower_line)
+        for raw_amt in matches:
+            if "%" in raw_amt:
+                continue
+            if is_price_like_number(raw_amt):
+                amt = int(raw_amt.replace(",", "").replace(".", ""))
+                tax_amounts.append(amt)
+
+    return tax_amounts
+
+
+def extract_price_like_from_line(line):
+    line = normalize_price_typo(line)
+    match = re.search(r"([\d.,]+)", line)
+    if match:
+        raw = match.group(1)
+        if "%" in raw:
+            return None
+        if is_price_like_number(raw):
+            return int(raw.replace(",", "").replace(".", ""))
+    return None
+
+
+def is_price_like_number(s: str, min_val: int = 100):
+    s_clean = s.replace(",", "").replace(".", "")
+    if not s_clean.isdigit():
+        return False
+    try:
+        val = int(s_clean)
+        return val >= min_val
+    except:
+        return False
+
 
 def clean_item_name(name: str) -> str:
     # Hapus karakter non-alfanumerik di awal dan akhir (selain huruf dan angka)
     return re.sub(r"^[^\w\d]+|[^\w\d]+$", "", name.strip())
 
-def process_receipt_data_with_ner(ner_results: List[Dict]) -> Dict:
-    """Process receipt data with discount handling."""
+def process_receipt_data_with_ner(ner_results: List[Dict], rec_texts: Any) -> Dict:
+    """Process receipt data and extract total/tax info from OCR."""
     reconstructed = reconstruct_items(ner_results)
     paired = pair_entities(reconstructed)
-    
+
     valid_items = []
-    discount_keywords = {"uc", "vc", "vc pt", "disc", "voucher", "diskon", "discount"}  # Keywords that indicate discounts
+    discount_keywords = {"uc", "vc", "vc pt", "disc", "voucher", "diskon", "discount"}
     
     i = 0
     n = len(paired)
-    
+
     while i < n:
         current_item = paired[i]
-        
-        # Bersihkan item name
         current_item['item_name'] = clean_item_name(current_item['item_name'])
-        
-        
-        # Skip if invalid
+
         if not current_item['item_name'] or not current_item['price'] or is_noise(current_item['item_name']) or is_short_or_symbol(current_item['item_name']):
             i += 1
             continue
 
-        # Check if the NEXT item is a discount
+        item_name_lower = current_item['item_name'].lower()
+
         if i + 1 < n:
             next_item = paired[i + 1]
             next_text = next_item['item_name'].lower()
-            
-            # If next item is a discount, subtract its price
+
             if any(keyword in next_text for keyword in discount_keywords):
                 current_item['price'] -= next_item['price']
-                i += 1  # Skip the discount item
-                
+                i += 1
+
+        if isinstance(current_item['price'], (int, float)):
+            current_item['price'] = abs(current_item['price'])
+        else:
+            i += 1
+            continue
+            
         valid_items.append(current_item)
         i += 1
-    
+
+    # Use original lines (not lowercased) to preserve tax keywords
+    tax_lines, tax_amounts = extract_tax_lines_with_context(rec_texts)
+    # Print hasil
+    print("Baris pajak terdeteksi:")
+    for line in tax_lines:
+        print(f" - {line}")
+
     return {
         'status': 'success',
+        'tax': sum(tax_amounts),
         'items': valid_items
     }
 
@@ -295,23 +399,20 @@ def read_image(image, ocr):
     preprocessed_ocr = preprocess_for_ocr(preprocessed)
 
     # Gunakan OCR global
-    ocr_result = ocr.predict(preprocessed_ocr)
+    ocr_global = ocr.predict(preprocessed_ocr)
     
     # If ocr_result is a list containing one dict
-    if isinstance(ocr_result, list) and len(ocr_result) > 0:
-        ocr_result = ocr_result[0]
+    if isinstance(ocr_global, list) and len(ocr_global) > 0:
+        ocr_global = ocr_global[0]
     
     # Now access rec_texts
-    detected_lines = ocr_result['rec_texts']
-    # print(f"detected_lines: {detected_lines}")
-    detected_text_lower = " ".join([t.lower() for t in detected_lines if t.strip()])
-    print(f"detected_text_lower: {detected_text_lower}")
-    
-    if any(keyword in detected_text_lower for keyword in keywords):
-        print("Keyword ditemukan. Proses ekstraksi data receipt...")
+    rec_texts = ocr_global['rec_texts']
+    detected_global_lower = " ".join([t.lower() for t in rec_texts if t.strip()])
 
-        # OCR berdasarkan bbox dari hasil deteksi model
-        detected_lines = []
+    detected_lines = []
+    
+    if any(keyword in detected_global_lower for keyword in keywords):
+        print("Keyword ditemukan. Proses ekstraksi data receipt...")
 
         for idx, bbox in enumerate(boxes):
             try:
@@ -323,7 +424,10 @@ def read_image(image, ocr):
                     # Extract text line by line
                     for text in ocr_result['rec_texts']:
                         if text.strip():  # Skip empty lines
-                            detected_lines.append(text) 
+                            detected_lines.append(text)  # Append the recognized text
+                
+                    # (Optional) Get bounding boxes for each line (if needed)
+                    # line_bboxes = ocr_result['dt_polys']  # List of bounding boxes (if required)
 
             except ValueError as e:
                 print(f"Error dalam cropping gambar: {e}")
@@ -334,16 +438,10 @@ def read_image(image, ocr):
 
         lines = split_detected_text(detected_text_lower)
         ner_results = detect_class(lines)
-        final_result = process_receipt_data_with_ner(ner_results)
+        final_result = process_receipt_data_with_ner(ner_results, rec_texts)
 
         print("SPLIT lines:", lines)
         print("NER results:", ner_results)
         print("FINAL:", final_result)
 
         return final_result
-
-    print("Tidak ada keyword penting ditemukan. Gambar bukan receipt/invoice.")
-    return {
-        "status": "not_receipt_invoice",
-        "error_msg": "Gambar yang Anda masukkan bukan receipt/invoice."
-    }
