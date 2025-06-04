@@ -1,447 +1,518 @@
 from ultralytics import YOLO
 import re
-from typing import List, Dict, Union, Any
+from typing import List, Dict, Union, Any, Tuple
 import numpy as np
 import cv2
 import os
+import requests
+from io import BytesIO
 from preprocessing import preprocess, preprocess_for_ocr
 
 ##LOAD MODEL
-# Dapatkan direktori dari file Python saat ini
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Bangun path absolut ke model
-model_path = os.path.join(BASE_DIR, 'best.pt')
-
-# Muat model
+model_path = os.path.join(BASE_DIR, 'best.pt') 
 model = YOLO(model_path)
 
-def process_model(image):
+def process_model(image: np.ndarray) -> Tuple[Union[np.ndarray, None], Union[np.ndarray, None]]:
     image_resized = preprocess(image)
-    results = model(image_resized)[0]  # Ambil hasil pertama
-    boxes = results.boxes  # Bounding box predictions
+    results = model(image_resized)[0]
+    if results.boxes is None or results.boxes.cls is None or len(results.boxes.cls) == 0:
+        return None, None
+    return results.boxes.xyxy.cpu().numpy(), results.boxes.cls.cpu().numpy().astype(int)
 
-    bboxes = boxes.xyxy.cpu().numpy()  # [x1, y1, x2, y2]
-    classes = boxes.cls.cpu().numpy().astype(int)  # Class index (int)
+##DEFINE
+label_map = {0: 'table', 1: 'not_table'}
+RECEIPT_DISCOUNT_KEYWORDS = {"uc", "vc", "vc pt", "disc", "voucher", "diskon", "discount", "potongan"}
 
-    return bboxes, classes
+# --- FUNGSI UTILITAS PEMROSESAN ANGKA ---
+def clean_digits_for_int(price_str_candidate: str) -> Union[int, None]:
+    if not price_str_candidate: return None
+    # MODIFIED LINE:
+    cleaned_str = re.sub(r'^RP\s*\.?\s*', '', price_str_candidate, flags=re.IGNORECASE).strip()
+    # END OF MODIFIED LINE
+    cleaned_str = cleaned_str.replace(':', '.').replace('o', '0',-1).replace('O', '0',-1).replace('ộ', '0',-1)
+    cleaned_str = re.sub(r'(\d)\s+(\d)', r'\1\2', cleaned_str)
+    just_digits = re.sub(r'[.,]', '', cleaned_str)
+    if just_digits.isdigit():
+        try: return int(just_digits)
+        except ValueError: return None
+    return None
 
-##DEFINE LABEL
-label_map = {
-    0: 'table',
-    1: 'not_table'
-}
-
-##SPLIT TEXT
-def split_detected_text(detected_text: str) -> List[str]:
-    """
-    Memecah string panjang hasil OCR menjadi list baris berdasarkan pola 'text price'
-    Misalnya: "nasi campur 75,ooo ayam 60,ooo" → ["nasi campur 75,ooo", "ayam 60,ooo"]
-    """
-
-    # Cari semua potongan yang diakhiri angka (misal 75,000 / 60.000 / 30.0)
-    # Asumsikan bahwa item akan memiliki angka di akhir
-    pattern = re.compile(r'(.*?\d[\d.,]*)(?=\s+[a-zA-Z]|$)')
-    lines = pattern.findall(detected_text)
-
-    # Bersihkan trailing whitespaces
-    lines = [line.strip() for line in lines if line.strip()]
-    return lines
-
-def extract_multiple_items_from_line(line: str) -> List[Dict[str, Union[str, int]]]:
-    """
-    Ekstrak pasangan item dan harga dari satu baris teks OCR.
-    Menangani multiple item+price dalam satu baris dengan memanfaatkan regex dan heuristik teks sebelumnya.
-    """
-
-    # Cari semua harga di baris (format bebas: 3300, 3,300, 3.300, dst)
-    matches = list(re.finditer(r'(\d{1,3}(?:[.,]\d{3})+|\d{4,})', line))
-
-    if not matches:
-        return []
-
-    items = []
-    last_end = 0
-
-    for match in matches:
-        price_str = match.group()
-        try:
-            price = int(price_str.replace(",", "").replace(".", ""))
-        except:
-            continue
-
-        # Ambil teks sebelum harga sebagai item
-        item_text = line[last_end:match.start()].strip()
-
-        # Hindari item kosong atau angka doang
-        if item_text and not item_text.replace(" ", "").isdigit():
-            items.append({
-                "item_name": item_text,
-                "price": price
-            })
-
-        last_end = match.end()
-
-    return items
-
-
-def clean_ocr_text(line: str) -> str:
-    # Gabungkan angka yang terpisah spasi: "10 0o0" -> "10000"
-    line = re.sub(r'(\d)\s+(\d)', r'\1\2', line)
-
-    # Ganti huruf 'o' atau 'O' yang tertulis sebagai nol
-    line = line.replace('o', '0').replace('O', '0')
-
-    return line
-
-def detect_class(lines: List[str]) -> List[Dict]:
-    processed_results = []
-
-    for line in lines:
-        item_price_pairs = extract_multiple_items_from_line(line)
-        if item_price_pairs:
-            for pair in item_price_pairs:
-                processed_results.append({
-                    'class': 'item',
-                    'text': pair['item_name']  # ← Fix di sini
-                })
-                processed_results.append({
-                    'class': 'price',
-                    'price': pair['price']
-                })
-        else:
-            processed_results.append({
-                'class': 'item',
-                'text': line
-            })
-
-    return processed_results
-
-
-def reconstruct_items(ner_results: List[Dict]) -> List[Dict]:
-    reconstructed = []
-    current_item = []
-    last_was_item = False
+def extract_discount_info_from_line(line: str, discount_keywords: set) -> Union[Dict[str, Any], None]:
+    """Mencari diskon pada baris. Mengembalikan dict {'text': desc, 'amount': val} atau None."""
+    line_lower = line.lower()
+    has_discount_keyword = any(keyword in line_lower for keyword in discount_keywords)
     
-    for entry in ner_results:
-        if entry['class'] == 'item':
-            if not last_was_item and current_item:
-                # Jika bertemu item baru, selesaikan item sebelumnya
-                reconstructed.append({
-                    'class': 'item',
-                    'text': ' '.join(current_item).strip(),
-                    'original_parts': current_item.copy()
-                })
-                current_item = []
-            current_item.append(entry['text'])
-            last_was_item = True
-        else:
-            if current_item:
-                # Selesaikan item yang sedang dibangun
-                reconstructed.append({
-                    'class': 'item',
-                    'text': ' '.join(current_item).strip(),
-                    'original_parts': current_item.copy()
-                })
-                current_item = []
-            reconstructed.append(entry)  # Tambahkan price/entitas lain
-            last_was_item = False
-    
-    # Tambahkan sisa item jika ada
-    if current_item:
-        reconstructed.append({
-            'class': 'item',
-            'text': ' '.join(current_item).strip(),
-            'original_parts': current_item.copy()
-        })
-    
-    return reconstructed
+    # Pola untuk (angka) atau -angka atau keyword diikuti angka
+    # Mengutamakan format dalam kurung atau dengan minus
+    match_paren = re.search(r'\(\s*([\d,.]+)\s*\)', line)
+    if match_paren:
+        amount = clean_digits_for_int(match_paren.group(1))
+        if amount and amount > 0:
+            desc = line[:match_paren.start()].strip() or "Discount"
+            return {'text': desc.upper(), 'amount': amount, 'type': 'parentheses'}
 
-def pair_entities(ner_results: List[Dict]) -> List[Dict]:
-    """Memasangkan item dan price yang berurutan"""
-    paired = []
-    i = 0
-    n = len(ner_results)
-    
-    while i < n:
-        if ner_results[i]['class'] == 'item':
-            item = ner_results[i]['text']
-            price = None
-            numeric_price = None
+    match_negative = re.search(r'-\s*([\d,.]+)', line)
+    if match_negative:
+        amount = clean_digits_for_int(match_negative.group(1))
+        if amount and amount > 0:
+            desc = line[:match_negative.start()].strip() or "Discount"
+            return {'text': desc.upper(), 'amount': amount, 'type': 'negative'}
 
-            # Cari price berikutnya
-            if i + 1 < n and ner_results[i+1]['class'] == 'price':
-                price_entry = ner_results[i+1]
-                price = price_entry.get('price')  # Akses 'price' jika sudah diganti
-                numeric_price = price_entry.get('price')  # Atau akses langsung numeric value
-
-                i += 1  # Lewati price yang sudah diproses
-            
-            paired.append({
-                'item_name': item,
-                'price': numeric_price
-            })
-        i += 1
-    
-    return paired
-
-
-def is_noise(text: str) -> bool:
-    """
-    Mengecek apakah suatu teks termasuk 'noise' (bukan item menu, misalnya total, service, dll)
-    """
-    noise_keywords = [
-        'subtotal', 'sub total', 'service', 'tax', 'pajak', 'pb1', 't0tal', 'subt0tal',
-        'r0unding','disk0n','disc0unt', 'vc', 'vc pt'
-        'rounding', 'diskon', 'discount', 'total', 'grand total', 'change', 'kembalian', 'srand tl'
-    ]
-    text = text.lower()
-    return any(keyword in text for keyword in noise_keywords)
-
-
-def is_short_or_symbol(text: str, min_length=3) -> bool:
-    """Check if text is too short or just symbols/numbers."""
-    stripped = text.strip()
-    # Skip if:
-    # - Length < min_length (default: 3)
-    # - Only digits/symbols (e.g., "1", "A", ",M")
-    return (
-        len(stripped) < min_length or
-        stripped.isdigit() or
-        (len(stripped) == 1 and not stripped.isalpha())
-    )
-
-def normalize_price_typo(text: str) -> str:
-    typo_map = {
-        'b': '8',
-        'B': '8',
-        'o': '0',
-        'O': '0',
-        'l': '1',
-        'I': '1',
-        'i': '1',
-        's': '5',
-        'S': '5',
-        'z': '2',
-        'Z': '2',
-    }
-    return ''.join(typo_map.get(c, c) for c in text)
-
-
-def extract_tax_lines_with_context(rec_texts, tax_keywords=None):
-    if tax_keywords is None:
-        tax_keywords = ["ppn", "pajak", "tax", "pjk", "service", "serv", "pb", "charge", "chrg"]
-
-    tax_lines = []
-    tax_amounts = []
-
-    n = len(rec_texts)
-
-    for i, line in enumerate(rec_texts):
-        lower_line = line.lower()
-
-        if any(k in lower_line for k in tax_keywords):
-            tax_lines.append(line)
-            found = False
-
-            # ✅ Cari angka yang terkait keyword di baris ini
-            matches = extract_tax_values_from_line_by_keyword(line, tax_keywords)
-            tax_amounts.extend(matches)
-            found = bool(matches)
-
-            # Kalau belum ketemu, cek baris setelah
-            if not found and i + 1 < n:
-                next_line = rec_texts[i + 1]
-                amount = extract_price_like_from_line(next_line)
-                if amount is not None:
-                    tax_amounts.append(amount)
-                    tax_lines.append(next_line)
-                    found = True
-
-            # Kalau masih belum, cek baris sebelum
-            if not found and i - 1 >= 0:
-                prev_line = rec_texts[i - 1]
-                amount = extract_price_like_from_line(prev_line)
-                if amount is not None:
-                    tax_amounts.append(amount)
-                    tax_lines.append(prev_line)
-
-    return tax_lines, tax_amounts
-
-
-def extract_tax_values_from_line_by_keyword(line, tax_keywords):
-    tax_amounts = []
-    lower_line = line.lower()
-
-    for keyword in tax_keywords:
-        pattern = rf"{keyword}\s*[:=]?\s*([\d.,]+)"
-        matches = re.findall(pattern, lower_line)
-        for raw_amt in matches:
-            if "%" in raw_amt:
-                continue
-            if is_price_like_number(raw_amt):
-                amt = int(raw_amt.replace(",", "").replace(".", ""))
-                tax_amounts.append(amt)
-
-    return tax_amounts
-
-
-def extract_price_like_from_line(line):
-    line = normalize_price_typo(line)
-    match = re.search(r"([\d.,]+)", line)
-    if match:
-        raw = match.group(1)
-        if "%" in raw:
-            return None
-        if is_price_like_number(raw):
-            return int(raw.replace(",", "").replace(".", ""))
+    if has_discount_keyword:
+        for keyword in discount_keywords:
+            pattern = rf"{re.escape(keyword)}\s*[:=\-]?\s*(?:(?:RP|Rp)\.?\s*)?([\d,.]+)"
+            keyword_match_amount = re.search(pattern, line, re.IGNORECASE)
+            if keyword_match_amount:
+                amount = clean_digits_for_int(keyword_match_amount.group(1))
+                if amount and amount > 0:
+                    desc = line[:keyword_match_amount.start()].strip() or keyword.upper()
+                    return {'text': desc.upper() or keyword.upper(), 'amount': amount, 'type': 'keyword'}
+        
+        trailing_numbers = re.findall(r'([\d,.]+)\b', line)
+        if trailing_numbers:
+            for num_str in reversed(trailing_numbers):
+                amount = clean_digits_for_int(num_str)
+                if amount and amount > 0 and amount < 50000: 
+                     desc = line.replace(num_str, "").strip() or "Discount"
+                     return {'text': desc.upper(), 'amount': amount, 'type': 'keyword_general_number'}
     return None
 
 
-def is_price_like_number(s: str, min_val: int = 100):
-    s_clean = s.replace(",", "").replace(".", "")
-    if not s_clean.isdigit():
-        return False
-    try:
-        val = int(s_clean)
-        return val >= min_val
-    except:
-        return False
+# --- FUNGSI PARSING STRUK ---
+def clean_receipt_item_name_heuristic(name: str) -> str:
+    if not name: return ""
+    cleaned_name = name 
+    match_qty_prefix = re.match(r'^(\d{1,2}\s?[Xx]?\s+)(.+)', name)
+    if match_qty_prefix:
+        cleaned_name = match_qty_prefix.group(2).strip() 
+    else: 
+         pass 
+
+    cleaned_name = re.sub(r'[\s\#\+\*\@\:\-\/\(\)]+$', '', cleaned_name).strip()
+    cleaned_name = re.sub(r'\s+(RP|Rp)$', '', cleaned_name, flags=re.IGNORECASE).strip()
+    return cleaned_name.strip()
 
 
-def clean_item_name(name: str) -> str:
-    # Hapus karakter non-alfanumerik di awal dan akhir (selain huruf dan angka)
-    return re.sub(r"^[^\w\d]+|[^\w\d]+$", "", name.strip())
-
-def process_receipt_data_with_ner(ner_results: List[Dict], rec_texts: Any) -> Dict:
-    """Process receipt data and extract total/tax info from OCR."""
-    reconstructed = reconstruct_items(ner_results)
-    paired = pair_entities(reconstructed)
-
-    valid_items = []
-    discount_keywords = {"uc", "vc", "vc pt", "disc", "voucher", "diskon", "discount"}
-    
+def parse_receipt_lines(
+    receipt_lines: List[str],
+    discount_keywords: set 
+) -> List[Dict[str, Union[str, int]]]:
+    parsed_items_gross = []
+    PRICE_THRESHOLD = 0 
     i = 0
-    n = len(paired)
+    
+    while i < len(receipt_lines):
+        current_line_original = receipt_lines[i].strip()
+        i += 1 # Langsung naikkan i untuk current_line
 
-    while i < n:
-        current_item = paired[i]
-        current_item['item_name'] = clean_item_name(current_item['item_name'])
+        if not current_line_original: continue
 
-        if not current_item['item_name'] or not current_item['price'] or is_noise(current_item['item_name']) or is_short_or_symbol(current_item['item_name']):
-            i += 1
+        # Filter awal untuk baris yang kemungkinan besar bukan nama item (misal, hanya angka atau diskon)
+        if re.fullmatch(r'\(\s*[\d,.]+\s*\)|-\s*[\d,.]+', current_line_original) or \
+           (current_line_original.isdigit() and len(current_line_original) > 4 and i > len(receipt_lines) * 0.6): # Heuristik untuk angka di blok summary
             continue
 
-        item_name_lower = current_item['item_name'].lower()
+        is_likely_summary_number_line = (
+            re.fullmatch(r'[\d.,]+', current_line_original) and # Hanya angka, titik, koma
+            len(re.sub(r'[.,]', '', current_line_original)) >= 1 and # Minimal satu digit angka
+            i > len(receipt_lines) * 0.5 # Berada di paruh kedua struk (heuristik)
+        )
+        is_discount_format_line = re.fullmatch(r'\(\s*[\d,.]+\s*\)|-\s*[\d,.]+', current_line_original)
 
-        if i + 1 < n:
-            next_item = paired[i + 1]
-            next_text = next_item['item_name'].lower()
-
-            if any(keyword in next_text for keyword in discount_keywords):
-                current_item['price'] -= next_item['price']
-                i += 1
-
-        if isinstance(current_item['price'], (int, float)):
-            current_item['price'] = abs(current_item['price'])
-        else:
-            i += 1
+        if is_discount_format_line or is_likely_summary_number_line:
             continue
-            
-        valid_items.append(current_item)
-        i += 1
 
-    # Use original lines (not lowercased) to preserve tax keywords
-    tax_lines, tax_amounts = extract_tax_lines_with_context(rec_texts)
-    # Print hasil
-    print("Baris pajak terdeteksi:")
-    for line in tax_lines:
-        print(f" - {line}")
+        item_name = ""
+        item_price_gross = None
+        
+        match_item_price_same_line = re.match(r'^(.*?)(?:\s+|\s*([+-]?\s*(?:RP|Rp)?\s*[\d.,]{4,}))$', current_line_original)
+        name_candidate_same_line = ""
+        price_candidate_same_line_str = ""
 
-    return {
-        'status': 'success',
-        'tax': sum(tax_amounts),
-        'items': valid_items
-    }
-
-# Inisialisasi OCR
-keywords = ['total', 'subtotal', 'amount', 'jumlah', 't0tal', 'subt0tal']
-
-def crop_image_by_bbox(image: np.ndarray, bbox: list) -> np.ndarray:
-    height, width = image.shape[:2]
-
-    if len(bbox) == 4:
-        x_min, y_min, x_max, y_max = bbox
-        x_min = int(max(0, min(x_min, width - 1)))
-        x_max = int(max(0, min(x_max, width - 1)))
-        y_min = int(max(0, min(y_min, height - 1)))
-        y_max = int(max(0, min(y_max, height - 1)))
-
-        cropped_image = image[y_min:y_max, x_min:x_max]
-        return cropped_image
-
-    elif len(bbox) == 8:
-        pts = np.array(bbox, dtype=np.float32).reshape(-1, 2)
-        dst_pts = np.array([[0, 0], [639, 0], [639, 639], [0, 639]], dtype=np.float32)
-        matrix = cv2.getPerspectiveTransform(pts, dst_pts)
-        cropped_image = cv2.warpPerspective(image, matrix, (640, 640))
-        return cropped_image
-
-    else:
-        raise ValueError("Format bbox tidak valid.")
-
-def read_image(image, ocr):
-    preprocessed = preprocess(image)
-    boxes, classes = process_model(preprocessed)
-
-    print("Langsung cek keyword dari OCR global...")
-
-    preprocessed_ocr = preprocess_for_ocr(preprocessed)
-
-    # Gunakan OCR global
-    ocr_global = ocr.predict(preprocessed_ocr)
-    
-    # If ocr_result is a list containing one dict
-    if isinstance(ocr_global, list) and len(ocr_global) > 0:
-        ocr_global = ocr_global[0]
-    
-    # Now access rec_texts
-    rec_texts = ocr_global['rec_texts']
-    detected_global_lower = " ".join([t.lower() for t in rec_texts if t.strip()])
-
-    detected_lines = []
-    
-    if any(keyword in detected_global_lower for keyword in keywords):
-        print("Keyword ditemukan. Proses ekstraksi data receipt...")
-
-        for idx, bbox in enumerate(boxes):
-            try:
-                cropped_image = crop_image_by_bbox(preprocessed_ocr, bbox)
-                ocr_result = ocr.predict(cropped_image)
-                if ocr_result and isinstance(ocr_result, list) and len(ocr_result) > 0:
-                    ocr_result = ocr_result[0]  # Get the first (and usually only) result dict
+        if match_item_price_same_line:
+            potential_price_str = match_item_price_same_line.group(2)
+            if potential_price_str:
+                price_val_same_line = clean_digits_for_int(potential_price_str)
+                if price_val_same_line is not None and price_val_same_line >= PRICE_THRESHOLD:
+                    name_candidate_same_line = match_item_price_same_line.group(1).strip()
+                    cleaned_name_cand = clean_receipt_item_name_heuristic(name_candidate_same_line)
                     
-                    # Extract text line by line
-                    for text in ocr_result['rec_texts']:
-                        if text.strip():  # Skip empty lines
-                            detected_lines.append(text)  # Append the recognized text
+                    if len(cleaned_name_cand) >= 2 and \
+                       not (cleaned_name_cand.isdigit() and len(cleaned_name_cand) > 3) and \
+                       not old_is_noise(cleaned_name_cand) and \
+                       not (re.fullmatch(r'\(\s*[\d,.]+\s*\)|-\s*[\d,.]+', cleaned_name_cand)):
+                        item_name = cleaned_name_cand
+                        item_price_gross = price_val_same_line
+
+        if not item_name: 
+            potential_item_name_curr_line = clean_receipt_item_name_heuristic(current_line_original)
+            
+            is_valid_potential_name = (
+                len(potential_item_name_curr_line) >= 2 and
+                not (potential_item_name_curr_line.isdigit() and len(potential_item_name_curr_line) > 3) and
+                not old_is_noise(potential_item_name_curr_line) and
+                not (re.fullmatch(r'\(\s*[\d,.]+\s*\)|-\s*[\d,.]+', potential_item_name_curr_line))
+            )
+
+            if is_valid_potential_name:
+                if i < len(receipt_lines):
+                    line1_after_name_str = receipt_lines[i].strip()
+                    qty_match_single_digit = re.fullmatch(r'\d{1,3}', line1_after_name_str) # Kuantitas tunggal di satu baris
+
+                    qty_price_match_on_line = re.match(r'^(\d{1,3})\s+([\d.,]{3,})$', line1_after_name_str) # Pola "QTY HARGA"
+
+                    if qty_match_single_digit and (i + 1) < len(receipt_lines): # Kasus: NAMA -> QTY -> HARGA (masing2 di baris baru)
+                        line2_after_name_str = receipt_lines[i+1].strip()
+                        price_val_after_qty = clean_digits_for_int(line2_after_name_str)
+                        if price_val_after_qty is not None and price_val_after_qty >= PRICE_THRESHOLD:
+                            item_name = potential_item_name_curr_line
+                            item_price_gross = price_val_after_qty
+                            i += 2
+                        
+                    elif qty_price_match_on_line: 
+                        price_str_from_qty_price = qty_price_match_on_line.group(2)
+                        price_val = clean_digits_for_int(price_str_from_qty_price)
+                        if price_val is not None and price_val >= PRICE_THRESHOLD:
+                            item_name = potential_item_name_curr_line
+                            item_price_gross = price_val
+                        
+                    elif not qty_match_single_digit:
+                        price_val_direct = clean_digits_for_int(line1_after_name_str)
+                        if price_val_direct is not None and price_val_direct >= PRICE_THRESHOLD:
+                            item_name = potential_item_name_curr_line
+                            item_price_gross = price_val_direct
+                            i += 1
+                            
+        if item_name and item_price_gross is not None:
+            #print(f"DEBUG PARSER: Menambahkan item='{item_name}', harga_kotor={item_price_gross}, dari_baris='{current_line_original}'") 
+            parsed_items_gross.append({
+                "item_name": item_name.upper(),
+                "price": item_price_gross 
+            })
+            
+    return parsed_items_gross
+
+def extract_summary_values(receipt_lines: List[str]) -> List[Dict[str, int]]:
+    summary_entries = []
+    potential_summary_lines = []
+    for line_idx in range(len(receipt_lines) - 1, -1, -1):
+        line_stripped = receipt_lines[line_idx].strip()
+        if re.fullmatch(r'[\d,.\s\(\)-]+', line_stripped) and any(char.isdigit() for char in line_stripped):
+            potential_summary_lines.append(line_stripped)
+        elif potential_summary_lines: 
+            break 
+        elif len(potential_summary_lines) == 0 and line_idx < len(receipt_lines) - 10:
+            break
+            
+    potential_summary_lines.reverse() # Kembalikan ke urutan asli
+
+    idx = 0
+    while idx < len(potential_summary_lines):
+        gross_price_str = potential_summary_lines[idx]
+        # Pastikan ini bukan baris diskon dalam kurung yang berdiri sendiri sebagai harga kotor
+        if re.fullmatch(r'\(\s*[\d,.]+\s*\)|-\s*[\d,.]+', gross_price_str):
+            idx += 1
+            continue
+
+        gross_price = clean_digits_for_int(gross_price_str)
+        if gross_price is None:
+            idx += 1
+            continue
+
+        is_likely_qty_in_summary = (gross_price <= 10 and gross_price >= 0) 
+        
+        has_paired_discount = False
+        if (idx + 1) < len(potential_summary_lines):
+            next_line_str_check = potential_summary_lines[idx+1].strip()
+            if re.fullmatch(r'\(\s*[\d,.]+\s*\)|-\s*[\d,.]+', next_line_str_check):
+                has_paired_discount = True
                 
-                    # (Optional) Get bounding boxes for each line (if needed)
-                    # line_bboxes = ocr_result['dt_polys']  # List of bounding boxes (if required)
+        if is_likely_qty_in_summary and not has_paired_discount:
+            #print(f"DEBUG SUMMARY_EXTRACT: Skipping likely QTY in summary: {gross_price_str}")
+            idx += 1 
+            continue
 
-            except ValueError as e:
-                print(f"Error dalam cropping gambar: {e}")
+        discount_amount = 0
+        if (idx + 1) < len(potential_summary_lines):
+            next_line_str = potential_summary_lines[idx+1].strip()
+            match_paren_discount = re.fullmatch(r'\(\s*([\d,.]+)\s*\)', next_line_str)
+            match_neg_discount = re.fullmatch(r'-\s*([\d,.]+)', next_line_str)
+            
+            if match_paren_discount:
+                discount_amount = clean_digits_for_int(match_paren_discount.group(1)) or 0
+                summary_entries.append({'gross': gross_price, 'discount': discount_amount})
+                idx += 2 # Konsumsi baris harga kotor dan baris diskon
                 continue
+            elif match_neg_discount:
+                discount_amount = clean_digits_for_int(match_neg_discount.group(1)) or 0
+                summary_entries.append({'gross': gross_price, 'discount': discount_amount})
+                idx += 2 # Konsumsi baris harga kotor dan baris diskon
+                continue
+        
+        # Jika tidak ada diskon berpasangan, harga kotor ini tidak ada diskonnya (dari summary)
+        summary_entries.append({'gross': gross_price, 'discount': 0})
+        idx += 1
+            
+    return summary_entries
 
-        detected_text_lower = " ".join([t.lower() for t in detected_lines])
-        print(detected_text_lower)
+def old_is_noise(text: str) -> bool:
+    noise_keywords = ['subtotal', 'sub total', 'service', 'tax', 'pajak', 'pb1', 't0tal', 'subt0tal','r0unding','disk0n','disc0unt', 'vc', 'vc pt', 'rounding', 'diskon', 'discount', 'total', 'grand total', 'change', 'kembalian', 'srand tl', 'menu', 'price', 'jumlah', 'kembali']
+    text_lower = text.lower()
+    if text_lower == "vc": return False 
+    return any(keyword in text_lower for keyword in noise_keywords)
 
-        lines = split_detected_text(detected_text_lower)
-        ner_results = detect_class(lines)
-        final_result = process_receipt_data_with_ner(ner_results, rec_texts)
+def old_is_short_or_symbol(text: str, min_length=2) -> bool: 
+    stripped = text.strip()
+    if len(stripped) < min_length : return True
+    if len(stripped) == 1 and not stripped.isalpha() and not stripped.isdigit(): return True
+    return False
 
-        print("SPLIT lines:", lines)
-        print("NER results:", ner_results)
-        print("FINAL:", final_result)
+def extract_tax_values_from_line_by_keyword(line_text: str, tax_keywords: List[str]) -> List[int]:
+    tax_amounts = []
+    for keyword in tax_keywords:
+        pattern = rf"(?:{re.escape(keyword)})\s*[:=\-]?\s*(?:(?:RP|Rp)\.?\s*)?([\d.,]+)"
+        matches = re.findall(pattern, line_text, flags=re.IGNORECASE)
+        for raw_amount in matches:
+            if "%" in raw_amount: continue
+            amount = clean_digits_for_int(raw_amount)
+            if amount is not None and amount > 0 : tax_amounts.append(amount)
+    return tax_amounts
 
-        return final_result
+def extract_tax_lines_with_context(rec_texts: List[str], tax_keywords: List[str] = None) -> Tuple[List[str], List[int]]:
+    if tax_keywords is None: tax_keywords = ["ppn", "pajak", "tax", "pjk", "service", "serv", "pb1", "pb 1", "charge", "chrg"]
+    all_tax_amounts = []; detected_tax_line_texts = []
+    for i, line_text in enumerate(rec_texts):
+        keyword_present = any(re.search(r'\b' + re.escape(kw) + r'\b', line_text, re.IGNORECASE) for kw in tax_keywords)
+        if keyword_present:
+            amounts_from_line = extract_tax_values_from_line_by_keyword(line_text, tax_keywords)
+            if amounts_from_line:
+                all_tax_amounts.extend(amounts_from_line); detected_tax_line_texts.append(line_text)
+            elif i + 1 < len(rec_texts):
+                next_line_text = rec_texts[i+1]
+                price_in_next_line = clean_digits_for_int(next_line_text)
+                if price_in_next_line and price_in_next_line > 0 and \
+                   not any(re.search(r'\b' + re.escape(kw) + r'\b', next_line_text, re.IGNORECASE) for kw in tax_keywords):
+                     if not any(noise_kw in line_text.lower() for noise_kw in ['subtotal', 'total', 'tagihan', 'bayar']):
+                        all_tax_amounts.append(price_in_next_line); detected_tax_line_texts.append(f"{line_text} -> {next_line_text}")
+    return list(set(detected_tax_line_texts)), all_tax_amounts
+
+def parse_ocr_space_table_for_invoice(ocr_json_response: Dict) -> List[Dict]:
+    parsed_items = [];
+    if not ocr_json_response or not ocr_json_response.get("ParsedResults"): return parsed_items
+    result = ocr_json_response["ParsedResults"][0]
+    if result.get("FileParseExitCode") not in [1, 2] : return parsed_items
+    if not result.get("TextTable"): return parsed_items
+    text_table = result["TextTable"]; rows = text_table.get("TextTableRows", [])
+    for row_data in rows:
+        cells = row_data.get("TextTableCells", [])
+        if len(cells) < 2: continue
+        item_name_str = cells[0].get("Text", "").strip() if len(cells) > 0 else ""
+        raw_price_str = "";
+        if len(cells) >= 4: raw_price_str = cells[3].get("Text", "").strip()
+        elif len(cells) >= 2: raw_price_str = cells[1].get("Text", "").strip()
+        price_val = clean_digits_for_int(raw_price_str)
+        if item_name_str and price_val is not None and price_val > 0:
+            lower_item_name = item_name_str.lower()
+            if any(kw in lower_item_name for kw in ["keterangan", "description", "harga", "price", "jml", "qty", "total", "amount", "sub total", "pajak", "pembayaran", "kepada :", "no invoice :", "tanggal :"]):
+                if len(item_name_str.split()) <= 2 and any(kw == lower_item_name for kw in ["keterangan", "harga", "jml", "total"]): continue
+            parsed_items.append({"item_name": item_name_str.upper(), "price": price_val}) 
+    return parsed_items
+
+def parse_invoice_lines_from_text(invoice_text_lines: List[str]) -> List[Dict]:
+    parsed_items = []
+    for line_idx, line in enumerate(invoice_text_lines):
+        original_line_for_debug = line; line_lower = line.lower()
+        skip_keywords = ["kepada :", "tanggal :", "no invoice :", "pembayaran :", "sub total", "total rp", "pajak rp", "terimakasih atas", "fashion terlengkap", "salford & co."]
+        if any(line_lower.startswith(kw) for kw in skip_keywords) or \
+           line_lower in ["keterangan", "harga", "jml", "total"]: continue
+        numbers_in_line = []
+        for match in re.finditer(r'(?:RP\s*\.?\s*)?(\d[\d.,]*\d|\d+)', line, re.IGNORECASE):
+            val = clean_digits_for_int(match.group(1));
+            if val is not None: numbers_in_line.append({'value': val, 'start': match.start(), 'end': match.end()})
+        if not numbers_in_line: continue
+        item_price = None; price_start_index = -1
+        for num_data in reversed(numbers_in_line):
+            if num_data['value'] >= 1000: item_price = num_data['value']; price_start_index = num_data['start']; break 
+        if item_price is None: continue
+        first_significant_number_start_index = price_start_index
+        if numbers_in_line: first_significant_number_start_index = numbers_in_line[0]['start']
+        item_name = line[:first_significant_number_start_index].strip()
+        item_name = re.sub(r'\s+(?:RP|Rp)\.?\s*$', '', item_name, flags=re.IGNORECASE).strip()
+        final_item_name = clean_item_name(item_name) 
+        if final_item_name and len(final_item_name) > 1 and not final_item_name.isdigit() and \
+           final_item_name.lower() not in ["keterangan", "harga", "jml", "total", "rp"]:
+            parsed_items.append({"item_name": final_item_name.upper(), "price": item_price})
+    return parsed_items
+
+def process_data_custom(
+    parsed_items_list: List[Dict], 
+    all_rec_texts_from_ocr: List[str],
+    is_receipt_logic: bool = True
+) -> Dict:
+    valid_items_final = []
+    for item_data in parsed_items_list: # Sudah berisi item dengan harga (mungkin sudah dikurangi diskon)
+        item_name_upper = item_data.get('item_name', "").strip()
+        price = item_data.get('price')
+
+        if not item_name_upper or price is None : continue
+        
+        item_name_cleaned = clean_item_name(item_name_upper) 
+        item_name_title_case = item_name_cleaned.title() 
+
+        min_len = 2
+        # Gunakan filter noise/short yang lebih sederhana di sini karena parsing utama sudah terjadi
+        if len(item_name_title_case) < min_len : continue
+        if item_name_title_case.isdigit() and not (item_name_title_case.lower() == "vc" and is_receipt_logic) : continue
+        if old_is_noise(item_name_title_case) and not (item_name_title_case.lower() == "vc" and is_receipt_logic): continue
+        
+        if price < 0 : price = 0 # Harga tidak boleh negatif
+        valid_items_final.append({'item_name': item_name_title_case, 'price': price})
+    
+    tax_keywords_list = ["ppn", "pajak", "tax", "pjk", "service", "serv", "pb1", "pb 1"]
+    _, tax_amounts_detected = extract_tax_lines_with_context(all_rec_texts_from_ocr, tax_keywords_list)
+    total_tax = sum(tax_amounts_detected)
+
+    final_result_json = {'status': 'success', 'tax': total_tax, 'items': valid_items_final }
+    if not valid_items_final :
+        final_result_json['status_detail'] = 'no_valid_items_finalized'
+    return final_result_json
+
+# --- Fungsi API Call & `read_image` ---
+def call_ocr_space_api(image_bytes: bytes, api_key: str, language: str = 'eng', 
+                       ocr_engine: int = 2, is_table: bool = False, 
+                       return_full_json: bool = False) -> Union[str, Dict, None]:
+    payload = { 'apikey': api_key, 'language': language, 'isOverlayRequired': False, 'scale': True,
+                'detectOrientation': True, 'OCREngine': ocr_engine, 'isTable': is_table }
+    try:
+        r = requests.post('https://api.ocr.space/parse/image', files={'filename': ('image.png', image_bytes)}, data=payload, timeout=45)
+        r.raise_for_status(); result = r.json()
+        print(f"DEBUG OCR Response (isTable={is_table}): {result}") # DEBUG
+        if result.get('IsErroredOnProcessing'): return None if return_full_json else ""
+        if not result.get('ParsedResults') or not result['ParsedResults'][0]: return None if return_full_json else ""
+        return result if return_full_json else result['ParsedResults'][0].get('ParsedText', "").strip()
+    except Exception as e:
+        # print(f"ERROR in call_ocr_space_api: {e}") # DEBUG
+        return None if return_full_json else ""
+
+keywords_to_trigger_extraction = ['total', 'subtotal', 'tagihan', 'tunai', 'kembali', 'indomaret', 'alfamart', 'invoice', 'kepada', 'rp', 'penjaringan', 'purchase', 'pasta', 'kemang', 'table #']
+
+def read_image(image_np: np.ndarray, api_key: str):
+    image_for_ocr_global_np = preprocess_for_ocr(image_np.copy())
+    _, buffer_global = cv2.imencode('.png', image_for_ocr_global_np)
+    image_bytes_global = buffer_global.tobytes()
+    parsed_text_global_str = call_ocr_space_api(image_bytes_global, api_key, ocr_engine=2)
+    if parsed_text_global_str is None: return {'status': 'error', 'message': 'Global OCR API call failed. Please try again.'}
+    rec_texts_global_lines = [line.strip() for line in parsed_text_global_str.splitlines() if line.strip()]
+    if not rec_texts_global_lines: return {'status': 'error', 'message': 'No text was detected in the image by Global OCR.'}
+    detected_global_lower = " ".join([t.lower() for t in rec_texts_global_lines if t])
+    if not any(keyword in detected_global_lower for keyword in keywords_to_trigger_extraction):
+        return {'status': 'error', 'message': 'The uploaded image does not appear to be a supported receipt or invoice, or essential keywords are missing.','ocr_text_global_for_reference': "\n".join(rec_texts_global_lines[:5])}
+
+    preprocessed_yolo_img = preprocess(image_np.copy()) 
+    boxes, classes = process_model(preprocessed_yolo_img)
+    if boxes is None or classes is None: return {'status': 'error', 'message': 'No objects were detected by the layout model in the image.'}
+    if 0 not in classes: return {'status': 'error', 'message': 'A valid itemization table (required for item extraction) was not detected by the layout model. The image may not be a supported type or is a new format not yet supported by Kakeibo.'}
+    
+    all_lines_from_table_crops = []
+    items_from_invoice_json_table = []
+    is_likely_invoice = "invoice" in detected_global_lower or "kepada :" in detected_global_lower or "no invoice" in detected_global_lower
+    
+    for i, box_class in enumerate(classes):
+        if box_class == 0: 
+            bbox = boxes[i]
+            h_orig,w_orig=image_np.shape[:2];h_yolo,w_yolo=preprocessed_yolo_img.shape[:2]
+            x1o,y1o,x2o,y2o=int(bbox[0]*w_orig/w_yolo),int(bbox[1]*h_orig/h_yolo),int(bbox[2]*w_orig/w_yolo),int(bbox[3]*h_orig/h_yolo)
+            cropped_img_np=crop_image_by_bbox(image_np.copy(),[x1o,y1o,x2o,y2o])
+            if cropped_img_np is None or cropped_img_np.size==0: continue
+            preprocessed_crop_ocr=preprocess_for_ocr(cropped_img_np)
+            if preprocessed_crop_ocr.size==0: continue
+            _,buffer_crop=cv2.imencode('.png',preprocessed_crop_ocr); image_bytes_crop=buffer_crop.tobytes()
+
+            if is_likely_invoice: 
+                json_resp_table = call_ocr_space_api(image_bytes_crop, api_key, ocr_engine=1, is_table=True, return_full_json=True)
+                if json_resp_table:
+                    parsed_table_items = parse_ocr_space_table_for_invoice(json_resp_table)
+                    if parsed_table_items: items_from_invoice_json_table.extend(parsed_table_items)
+                    table_area_text = json_resp_table.get("ParsedResults",[{}])[0].get("ParsedText","")
+                    if table_area_text: all_lines_from_table_crops.extend([l.strip() for l in table_area_text.splitlines() if l.strip()])
+            else: 
+                parsed_text_crop_str = call_ocr_space_api(image_bytes_crop, api_key, ocr_engine=2)
+                if parsed_text_crop_str:
+                    all_lines_from_table_crops.extend([l.strip() for l in parsed_text_crop_str.splitlines() if l.strip()])
+    
+    parsed_items_gross = parse_receipt_lines(all_lines_from_table_crops, RECEIPT_DISCOUNT_KEYWORDS)
+    print(f"DEBUG READ_IMAGE: parsed_items_gross = {parsed_items_gross}") # DEBUG
+
+    summary_details = extract_summary_values(all_lines_from_table_crops)
+    print(f"DEBUG READ_IMAGE: summary_details = {summary_details}") # DEBUG
+
+    # ---> PERBAIKAN KRUSIAL DI SINI <---
+    final_items_to_process = [] # PASTIKAN DIINISIALISASI SEBAGAI LIST KOSONG!
+
+    temp_parsed_items_gross = list(parsed_items_gross) # Buat salinan untuk diiterasi
+    matched_summary_indices = [False] * len(summary_details)
+
+    for item_g_idx, item_g in enumerate(temp_parsed_items_gross):
+        item_applied_from_summary = False
+        for summ_idx, summ_entry in enumerate(summary_details):
+             print(f"DEBUG SUMMARY LOOP: Membandingkan dengan summ_entry = {summ_entry}") # DEBUG
+             if not matched_summary_indices[summ_idx] and item_g['price'] == summ_entry['gross']:
+                print(f"DEBUG SUMMARY LOOP: COCOK! Harga bersih = {summ_entry['gross'] - summ_entry['discount']}") # DEBUG
+                final_items_to_process.append({
+                    "item_name": item_g["item_name"],
+                    "price": summ_entry['gross'] - summ_entry['discount'], # Harga bersih
+                    # "original_price": summ_entry['gross'], # Opsional
+                    # "discount_value": summ_entry['discount'] # Opsional
+                })
+                matched_summary_indices[summ_idx] = True
+                item_applied_from_summary = True
+                break 
+
+        if not item_applied_from_summary:
+            print(f"DEBUG SUMMARY LOOP: TIDAK COCOK untuk item_g = {item_g}, harga kotor dipertahankan.")
+            final_items_to_process.append({
+                "item_name": item_g["item_name"],
+                "price": item_g["price"]
+            })
+
+    processing_as_receipt_flag = not is_likely_invoice
+
+    if is_likely_invoice: 
+        if items_from_invoice_json_table:
+            final_items_to_process = items_from_invoice_json_table; processing_as_receipt_flag = False
+        elif all_lines_from_table_crops: 
+            invoice_items_fallback = parse_invoice_lines_from_text(all_lines_from_table_crops)
+            if invoice_items_fallback: final_items_to_process = invoice_items_fallback; processing_as_receipt_flag = False
+    
+    if not final_items_to_process and all_lines_from_table_crops: 
+        if not is_likely_invoice: processing_as_receipt_flag = True
+        if processing_as_receipt_flag:
+            final_items_to_process = parse_receipt_lines(all_lines_from_table_crops, RECEIPT_DISCOUNT_KEYWORDS)
+    
+    if not final_items_to_process:
+        tax_only_result = process_data_custom([], rec_texts_global_lines, is_receipt_logic=processing_as_receipt_flag)
+        return {'status': 'error', 'message': 'No items could be extracted from the detected table regions. Tax information (if any) is based on global OCR.','tax': tax_only_result.get('tax', 0),'items': []}
+
+    final_structured_result = process_data_custom(final_items_to_process, rec_texts_global_lines, is_receipt_logic=processing_as_receipt_flag)
+    
+    if final_structured_result.get('status_detail') == 'no_valid_items_finalized':
+        final_structured_result['status'] = 'warning'
+        final_structured_result['message'] = 'Item processing of table regions was performed, but no valid items were finalized. This may be due to OCR quality or structure within the table regions.'
+        del final_structured_result['status_detail']
+    return final_structured_result
+
+# --- Helper Functions ---
+def clean_item_name(name: str) -> str:
+    name = re.sub(r"^[^\w\d\s\-/()]+|[^\w\d\s\-/()]+$", "", name.strip())
+    return name
+
+def crop_image_by_bbox(image: np.ndarray, bbox: list) -> Union[np.ndarray, None]:
+    h, w = image.shape[:2];
+    if len(bbox) == 4:
+        x_min,y_min,x_max,y_max=map(int,bbox);
+        x_min=max(0,min(x_min,w-1));x_max=max(0,min(x_max,w-1));
+        y_min=max(0,min(y_min,h-1));y_max=max(0,min(y_max,h-1));
+        if x_min>=x_max or y_min>=y_max: return None
+        return image[y_min:y_max,x_min:x_max]
+    return None

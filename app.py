@@ -2,12 +2,20 @@ from flask import Flask, request, jsonify
 from PIL import Image
 import numpy as np
 from io import BytesIO
-from load_model import read_image
-from paddleocr import PaddleOCR
+from load_model import read_image 
+import os 
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 
-ocr = PaddleOCR(use_textline_orientation=True, lang='en')
+api_key = os.environ.get('OCR_SPACE_API_KEY')
+
+if api_key:
+    print(f"API Key dari .env: {api_key}")
+else:
+    print("Error: OCR_SPACE_API_KEY tidak ditemukan di .env atau environment.")
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -19,12 +27,14 @@ def predict():
         return jsonify({'status': 'error', 'message': 'Tidak ada file gambar yang dimasukkan.'}), 400
 
     try:
-        # Membaca gambar dan mengonversinya menjadi array NumPy
-        image = Image.open(file.stream)
+        # Membaca gambar
+        image_bytes = file.read() # Baca sebagai bytes untuk dikirim ke API atau diproses
+        image = Image.open(BytesIO(image_bytes))
         image_np = np.array(image)
 
-        # Memproses gambar dengan fungsi read_image
-        result = read_image(image_np, ocr)
+        # Memproses gambar dengan fungsi read_image yang sudah dimodifikasi
+        # Kita akan meneruskan API key ke fungsi read_image
+        result = read_image(image_np, api_key) # Modifikasi di sini
 
         return jsonify(result), 200
     except Exception as e:
