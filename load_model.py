@@ -109,18 +109,18 @@ def extract_name_and_price_from_line_v2(line: str) -> Tuple[Union[str, None], Un
             name_part = clean_name_general(name_candidate)
             price_val = price
             if name_part:
-                 qty_ending_match = re.match(r'^(.*?)\s+(\d{1,2})$', name_part) # Cari angka 1-2 digit di akhir nama
-                 if qty_ending_match and price_val is not None and price_val >= 1000 : 
-                     name_before_qty = clean_name_general(qty_ending_match.group(1))
-                     if name_before_qty:
-                         name_part = name_before_qty
-                         # quantity_extracted = qty_ending_match.group(2) # Bisa disimpan jika perlu
+                qty_ending_match = re.match(r'^(.*?)\s+(\d{1,2})$', name_part) # Cari angka 1-2 digit di akhir nama
+                if qty_ending_match and price_val is not None and price_val >= 1000 : 
+                    name_before_qty = clean_name_general(qty_ending_match.group(1))
+                    if name_before_qty:
+                        name_part = name_before_qty
+                        # quantity_extracted = qty_ending_match.group(2) # Bisa disimpan jika perlu
         else: 
             name_part = clean_name_general(line)
             price_val = None
     else: 
         if any(c.isalpha() for c in line):
-             name_part = clean_name_general(line)
+            name_part = clean_name_general(line)
         price_val = None
 
     return name_part if name_part else None, price_val
@@ -265,7 +265,7 @@ def parse_invoice_lines_from_text(invoice_text_lines: List[str]) -> List[Dict]:
                          "terimakasih atas", "bank :", "no. rek :", "a/n :", "jumlah total", "jatuh tempo"]
         if any(kw in line_lower for kw in skip_keywords) or \
            line_lower in ["keterangan", "harga", "jml", "total", "deskripsi", "jumlah", "item", "description", "amount", "price", "qty", "uraian", "satuan"]: 
-           continue
+            continue
         
         name_part, price_val = extract_name_and_price_from_line_v2(line) 
 
@@ -274,6 +274,50 @@ def parse_invoice_lines_from_text(invoice_text_lines: List[str]) -> List[Dict]:
                not (len(name_part.split()) == 1 and name_part.lower() in ["rp", "idr"]):
                 parsed_items.append({"item_name": name_part.upper(), "price": price_val}) # Nama sudah di .title() oleh extract_name_and_price_from_line_v2
     return parsed_items
+
+# --- FUNGSI PEMBERSIH NAMA ITEM YANG TELAH DIPERBARUI ---
+def final_item_name_cleaning(item_name: str) -> str:
+    """
+    Membersihkan nama item dengan menghapus pola angka dan teks di akhir string yang
+    kemungkinan merupakan sisa dari harga, kuantitas, atau format invoice.
+
+    Args:
+        item_name: Nama item asli.
+
+    Returns:
+        Nama item yang sudah dibersihkan.
+    """
+    if not item_name:
+        return ""
+
+    # Pola 0 (BARU): Menghapus pola spesifik dari invoice.
+    # Contoh: "KAOS RP 100000 1 RP" -> "KAOS"
+    # Pola ini mencari " RP <harga> <kuantitas> RP" di akhir string.
+    # Menggunakan re.IGNORECASE untuk menangani "RP" atau "rp".
+    cleaned = re.sub(r'\s+RP\s+\d+\s+\d+\s+RP$', '', item_name, flags=re.IGNORECASE).strip()
+    if cleaned != item_name:
+        return cleaned
+
+    # Pola 1: Menghapus "<spasi><1-2 digit><spasi><3+ digit>" dari akhir.
+    # Contoh: "Idm Tas Rmh Lngk Kcl 1 3100" -> "Idm Tas Rmh Lngk Kcl"
+    cleaned = re.sub(r'\s+\d{1,2}\s+\d{3,}$', '', item_name).strip()
+    if cleaned != item_name:
+        return cleaned
+
+    # Pola 2: Menghapus "<spasi><3+ digit>" dari akhir.
+    # Contoh: "Some Item 45000" -> "Some Item"
+    cleaned = re.sub(r'\s+\d{3,}$', '', item_name).strip()
+    if cleaned != item_name:
+        return cleaned
+        
+    # Pola 3: Menghapus kuantitas "<spasi><1-2 digit>" dari akhir.
+    # Contoh: "Bambi Baby Powder 1" -> "Bambi Baby Powder"
+    match = re.match(r'^(.*[a-zA-Z].*)\s(\d{1,2})$', item_name)
+    if match:
+        return match.group(1).strip()
+
+    return item_name # Kembalikan nama asli jika tidak ada pola yang cocok
+
 
 def process_data_custom(
     parsed_items_list: List[Dict], 
@@ -287,11 +331,13 @@ def process_data_custom(
     unique_items_tracker = set()
 
     for item_data in parsed_items_list:
-        item_name_original = item_data.get('item_name', "") # Sudah di .title() dari extract_name_and_price_from_line_v2
+        item_name_original = item_data.get('item_name', "")
         price = item_data.get('price')
         if not item_name_original or price is None: continue
         
-        item_name_final = item_name_original 
+        # Terapkan pembersihan akhir pada nama item
+        item_name_final = final_item_name_cleaning(item_name_original)
+        
         min_len = 2
         if len(item_name_final) < min_len: continue
         if item_name_final.isdigit() and not (item_name_final.lower() == "vc" and is_receipt_logic) : continue
@@ -306,13 +352,13 @@ def process_data_custom(
         valid_items_final.append({'item_name': item_name_final, 'price': price})
     
     total_tax_final = 0
-    if is_receipt_logic and pre_calculated_tax is not None: # Harusnya pre_calculated_tax akan None untuk struk sekarang
+    if is_receipt_logic and pre_calculated_tax is not None:
         total_tax_final = pre_calculated_tax
         print(f"DEBUG process_data_custom: Using pre_calculated_tax for receipt: {total_tax_final}")
     else: 
         print(f"DEBUG process_data_custom: Calculating tax using extract_tax_lines_with_context on global OCR text.")
         _, tax_amounts_detected = extract_tax_lines_with_context(all_rec_texts_from_ocr, list(TAX_KEYWORDS))
-        total_tax_final = sum(tax_amounts_detected) # sum dari list unik pajak
+        total_tax_final = sum(tax_amounts_detected)
         print(f"DEBUG process_data_custom: Calculated tax from global text: {total_tax_final}")
 
     final_result_json = {'status': 'success', 'tax': total_tax_final, 'items': valid_items_final }
@@ -330,7 +376,6 @@ def call_ocr_space_api(image_bytes: bytes, api_key: str, language: str = 'eng',
     try:
         r = requests.post('https://api.ocr.space/parse/image', files={'filename': ('image.png', image_bytes)}, data=payload, timeout=45)
         r.raise_for_status(); result = r.json()
-        # print(f"DEBUG OCR Response (isTable={is_table}): {result}") 
         if result.get('IsErroredOnProcessing'): return None if return_full_json else ""
         if not result.get('ParsedResults') or not result['ParsedResults'][0]: return None if return_full_json else ""
         parsed_text_output = result['ParsedResults'][0].get('ParsedText', "").strip()
@@ -370,7 +415,6 @@ def read_image(image_np: np.ndarray, api_key: str):
         for i_box, box_class_val in enumerate(classes):
             if box_class_val == 0: 
                 bbox = boxes[i_box]
-                # ... (cropping logic seperti sebelumnya) ...
                 h_orig,w_orig=image_np.shape[:2];h_yolo,w_yolo=preprocessed_yolo_img.shape[:2]
                 x1o,y1o,x2o,y2o=int(bbox[0]*w_orig/w_yolo),int(bbox[1]*h_orig/h_yolo),int(bbox[2]*w_orig/w_yolo),int(bbox[3]*h_orig/h_yolo)
                 cropped_img_np=crop_image_by_bbox(image_np.copy(),[x1o,y1o,x2o,y2o])
@@ -404,7 +448,7 @@ def read_image(image_np: np.ndarray, api_key: str):
     if is_likely_invoice:
         print("DEBUG read_image: Terdeteksi sebagai INVOICE.")
         items_to_be_custom_processed = parse_invoice_lines_from_text(all_lines_from_table_crops_str.splitlines())
-        if not items_to_be_custom_processed and rec_texts_global_lines != all_lines_from_table_crops_str.splitlines(): # Fallback ke teks global jika dari tabel gagal
+        if not items_to_be_custom_processed and rec_texts_global_lines != all_lines_from_table_crops_str.splitlines():
              items_to_be_custom_processed = parse_invoice_lines_from_text(rec_texts_global_lines)
         
     else: 
@@ -434,11 +478,11 @@ def read_image(image_np: np.ndarray, api_key: str):
        not final_structured_result.get('items'):
         current_tax = final_structured_result.get('tax', 0)
         if current_tax > 0 :
-             final_structured_result['status'] = 'warning'
-             final_structured_result['message'] = 'No items were extracted, but tax information was found globally.'
+            final_structured_result['status'] = 'warning'
+            final_structured_result['message'] = 'No items were extracted, but tax information was found globally.'
         else:
-             final_structured_result['status'] = 'error'
-             final_structured_result['message'] = 'No items or tax information could be extracted.'
+            final_structured_result['status'] = 'error'
+            final_structured_result['message'] = 'No items or tax information could be extracted.'
         if 'status_detail' in final_structured_result: del final_structured_result['status_detail']
     elif final_structured_result.get('status_detail') == 'no_valid_items_finalized':
         final_structured_result['status'] = 'warning'
@@ -452,15 +496,6 @@ def read_image(image_np: np.ndarray, api_key: str):
         final_structured_result['status'] = 'error'
         final_structured_result['message'] = f'Failed to extract meaningful data. Extraction status: {status_from_extraction}'
     return final_structured_result
-
-
-def clean_item_name(name: str) -> str:
-    if not name: return ""
-    name = re.sub(r"[^\w\s&/\-\(\)\%\+.,]", "", name) 
-    name = name.strip()
-    # Hapus spasi ganda
-    name = re.sub(r"\s+", " ", name)
-    return name.strip()
 
 def crop_image_by_bbox(image: np.ndarray, bbox: list) -> Union[np.ndarray, None]:
     h, w = image.shape[:2];
