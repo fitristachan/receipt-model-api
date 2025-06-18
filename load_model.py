@@ -26,10 +26,18 @@ RECEIPT_DISCOUNT_KEYWORDS = {"uc", "vc", "vc pt", "disc", "voucher", "diskon", "
 
 def clean_digits_for_int(price_str_candidate: str) -> Union[int, None]:
     if not price_str_candidate: return None
-    cleaned_str = re.sub(r'^RP\s*\.?\s*', '', price_str_candidate, flags=re.IGNORECASE).strip()
-    cleaned_str = cleaned_str.replace(':', '.').replace('o', '0',-1).replace('O', '0',-1).replace('ộ', '0',-1)
-    cleaned_str = re.sub(r'(\d)\s+(\d)', r'\1\2', cleaned_str)
-    just_digits = re.sub(r'[.,]', '', cleaned_str)
+    # Remove any non-numeric/non-comma/non-dot/non-slash characters that might be OCR errors,
+    # This also removes spaces if they were passed in, as we now handle internal spaces in the line pre-processing.
+    cleaned_str = price_str_candidate.replace(' ', '') # Ensure all spaces are gone for int conversion
+    cleaned_str = re.sub(r'^RP\s*\.?\s*', '', cleaned_str, flags=re.IGNORECASE).strip()
+    cleaned_str = cleaned_str.replace(':', '.') # Normalize colons to dots for decimals, if any
+    
+    # NEW: Remove any remaining non-digit, non-comma, non-dot characters before final cleaning
+    # This targets characters like '•' or '\'' that might appear
+    cleaned_str = re.sub(r'[^\d.,]', '', cleaned_str) 
+
+    just_digits = re.sub(r'[.,]', '', cleaned_str) # Remove commas and dots for integer conversion
+    
     if just_digits.isdigit():
         try: return int(just_digits)
         except ValueError: return None
@@ -39,42 +47,50 @@ def extract_discount_info_from_line(line: str, discount_keywords: set) -> Union[
     line_lower = line.lower()
     has_discount_keyword = any(keyword in line_lower for keyword in discount_keywords)
     
+    # Always check for parentheses or negative signs first, as these are strong indicators
     match_paren = re.search(r'\(\s*([\d,.]+)\s*\)', line)
     if match_paren:
         amount = clean_digits_for_int(match_paren.group(1))
-        if amount and amount > 0:
+        if amount is not None and amount > 0: # amount could be 0 from cleaning if it was just punctuation
             desc = line[:match_paren.start()].strip() or "Discount"
             return {'text': desc.upper(), 'amount': amount, 'type': 'parentheses'}
 
     match_negative = re.search(r'-\s*([\d,.]+)', line)
     if match_negative:
         amount = clean_digits_for_int(match_negative.group(1))
-        if amount and amount > 0:
+        if amount is not None and amount > 0:
             desc = line[:match_negative.start()].strip() or "Discount"
             return {'text': desc.upper(), 'amount': amount, 'type': 'negative'}
 
+    # Only proceed with keyword-based or general number detection if a keyword is present
     if has_discount_keyword:
         for keyword in discount_keywords:
+            # Pattern to find keyword followed by amount
             pattern = rf"{re.escape(keyword)}\s*[:=\-]?\s*(?:(?:RP|Rp)\.?\s*)?([\d,.]+)"
             keyword_match_amount = re.search(pattern, line, re.IGNORECASE)
             if keyword_match_amount:
                 amount = clean_digits_for_int(keyword_match_amount.group(1))
-                if amount and amount > 0:
+                if amount is not None and amount > 0:
                     desc = line[:keyword_match_amount.start()].strip() or keyword.upper()
                     return {'text': desc.upper() or keyword.upper(), 'amount': amount, 'type': 'keyword'}
         
+        # This part will now ONLY run if has_discount_keyword is True,
+        # meaning it will only look for trailing numbers if a discount keyword was found.
         trailing_numbers = re.findall(r'([\d,.]+)\b', line)
         if trailing_numbers:
             for num_str in reversed(trailing_numbers):
                 amount = clean_digits_for_int(num_str)
-                if amount and amount > 0 and amount < 1000000:
+                # Add a sanity check for amount range for general trailing numbers
+                if amount is not None and amount > 0 and amount < 1000000: # 1.000.000 (1 juta) as an arbitrary upper limit for likely discounts
                     desc = line.replace(num_str, "").strip() or "Discount"
                     return {'text': desc.upper(), 'amount': amount, 'type': 'keyword_general_number'}
     return None
 
 def _clean_price_for_extraction_v2(text_price: str) -> Union[int, None]:
     if not text_price: return None
-    text_cleaned = text_price.replace('/', '') 
+    # Remove all spaces first
+    text_cleaned = text_price.replace(' ', '') 
+    # Now remove non-digit characters (keeping only digits)
     text_cleaned = re.sub(r"[^\d]", "", text_cleaned)
     if text_cleaned.isdigit() and text_cleaned:
         try:
@@ -91,40 +107,67 @@ def clean_name_general(name: str) -> str:
     return name.title()
 
 def extract_name_and_price_from_line_v2(line: str) -> Tuple[Union[str, None], Union[int, None]]:
+    original_line = line # Keep original for debugging/context
     line = line.strip()
     if not line:
         return None, None
 
-    match = re.match(r'^(.*?)\s+([\d.,/]+)$', line)
+    # --- NEW PRE-PROCESSING STEP FOR THE LINE ---
+    # 1. Remove common noise characters that might appear inside/around numbers
+    #    e.g., '•', '''
+    cleaned_for_parsing = re.sub(r"[^A-Za-z0-9\s.,/\-]", "", line) # Keep alphanumeric, spaces, commas, dots, slashes, hyphens
     
+    # 2. Normalize spaces around numbers/commas/dots to prevent splitting valid parts
+    #    e.g., "4, 400" -> "4,400"
+    cleaned_for_parsing = re.sub(r'(\d)\s*,\s*(\d)', r'\1,\2', cleaned_for_parsing) # 4, 400 -> 4,400
+    cleaned_for_parsing = re.sub(r'(\d)\s*\.\s*(\d)', r'\1.\2', cleaned_for_parsing) # 4. 400 -> 4.400
+    
+    # NEW: Conditionally remove space between number and last 2-3 digits (e.g. "22 400" -> "22400")
+    # This prevents splitting valid prices but avoids concatenating two separate price columns.
+    cleaned_for_parsing = re.sub(r'(\d)\s+(?=\d{2,3}$)', r'\1', cleaned_for_parsing) # 22 400 -> 22400, but not 5500 5500 -> 55005500
+    
+    # 3. Ensure consistent single spacing between words/tokens
+    cleaned_for_parsing = re.sub(r'\s+', ' ', cleaned_for_parsing).strip()
+    # --- END NEW PRE-PROCESSING ---
+
+    # --- ATTEMPT TO EXTRACT PRICE FROM THE END OF THE LINE ---
+    # We will try to find the last sequence that looks like a price.
+    # Pattern: [name part] [optional currency] [last numeric value]
+    # This regex is specifically designed to get the LAST valid price at the end of the line.
+    # It looks for an optional currency symbol, then a numeric sequence, followed by the end of the line.
+    # The `([\d.,/]+)` ensures we capture the entire last block.
+    
+    # Regex for final price extraction
+    # This pattern tries to be precise: it captures an optional currency prefix,
+    # then a block of digits/commas/dots/slashes, then the end of the line.
+    # It should avoid capturing two distinct price columns.
+    match = re.search(r'^(.*?)\s*(?:RP|Rp\s*\.?\s*)?([\d.,/]+)\s*$', cleaned_for_parsing, re.IGNORECASE)
+
     name_part = None
     price_val = None
 
     if match:
         name_candidate = match.group(1).strip()
-        price_str_candidate = match.group(2).strip()
-        price = _clean_price_for_extraction_v2(price_str_candidate)
+        price_str_candidate = match.group(2).strip() 
+        price = clean_digits_for_int(price_str_candidate) # Use the now robust clean_digits_for_int
         
         if price is not None:
             name_part = clean_name_general(name_candidate)
             price_val = price
+            # Re-check quantity ending on the potentially cleaned name_part
             if name_part:
-                qty_ending_match = re.match(r'^(.*?)\s+(\d{1,2})$', name_part) # Cari angka 1-2 digit di akhir nama
-                if qty_ending_match and price_val is not None and price_val >= 1000 : 
-                    name_before_qty = clean_name_general(qty_ending_match.group(1))
-                    if name_before_qty:
-                        name_part = name_before_qty
-                        # quantity_extracted = qty_ending_match.group(2) # Bisa disimpan jika perlu
-        else: 
-            name_part = clean_name_general(line)
-            price_val = None
-    else: 
-        if any(c.isalpha() for c in line):
-            name_part = clean_name_general(line)
-        price_val = None
+                qty_ending_match = re.match(r'^(.*[a-zA-Z].*)\s+(\d{1,2})$', name_part) 
+                if qty_ending_match and len(qty_ending_match.group(1).strip()) >= 2: 
+                    name_part = clean_name_general(qty_ending_match.group(1))
+            return name_part if name_part else None, price_val
+
+    # Fallback if no strong price pattern found after cleaning and splitting
+    # This means the line might contain text but no identifiable price at the end.
+    if any(c.isalpha() for c in cleaned_for_parsing): # Check original cleaned line for alpha chars
+        name_part = clean_name_general(cleaned_for_parsing)
+    price_val = None
 
     return name_part if name_part else None, price_val
-
 
 def extract_ocr_items_v2(text: str) -> Dict[str, Any]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -135,6 +178,18 @@ def extract_ocr_items_v2(text: str) -> Dict[str, Any]:
         current_line = lines[i]
         print(f"DEBUG v2 Processing line: '{current_line}'")
 
+        # --- IMPORTANT CHANGE: Try to extract item first ---
+        name, price_on_line = extract_name_and_price_from_line_v2(current_line)
+        print(f"DEBUG v2: extract_name_and_price_from_line_v2('{current_line}') -> name='{name}', price='{price_on_line}'")
+
+        if name and price_on_line is not None:
+            # If a valid item (name + price) is found, add it and move to the next line.
+            items.append({"item_name": name, "price": price_on_line})
+            i += 1
+            continue # Skip discount check for this line if it's an item
+        # --- END IMPORTANT CHANGE ---
+
+        # If it's not detected as a main item line, then check for discounts
         discount_info = extract_discount_info_from_line(current_line, RECEIPT_DISCOUNT_KEYWORDS)
         
         if discount_info and discount_info.get('amount'):
@@ -152,12 +207,7 @@ def extract_ocr_items_v2(text: str) -> Dict[str, Any]:
             i += 1
             continue
         
-        name, price_on_line = extract_name_and_price_from_line_v2(current_line)
-        print(f"DEBUG v2: extract_name_and_price_from_line_v2('{current_line}') -> name='{name}', price='{price_on_line}'")
-
-        if name and price_on_line is not None:
-            items.append({"item_name": name, "price": price_on_line})
-            
+        # If it's neither a clear item nor a discount line, log and move on
         elif name and price_on_line is None: 
             print(f"DEBUG v2: Line with name but no price, skipping as main item (could be desc/header): '{name}'")
         
