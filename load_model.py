@@ -8,7 +8,6 @@ import requests
 from io import BytesIO
 from preprocessing import preprocess, preprocess_for_ocr
 
-##LOAD MODEL
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 model_path = os.path.join(BASE_DIR, 'best.pt') 
 model = YOLO(model_path)
@@ -20,9 +19,13 @@ def process_model(image: np.ndarray) -> Tuple[Union[np.ndarray, None], Union[np.
         return None, None
     return results.boxes.xyxy.cpu().numpy(), results.boxes.cls.cpu().numpy().astype(int)
 
-# --- KEYWORDS---
 TAX_KEYWORDS = {"ppn", "pajak", "tax", "pjk", "service", "serv", "pb1", "pb 1", "charge", "chrg"}
 RECEIPT_DISCOUNT_KEYWORDS = {"uc", "vc", "vc pt", "disc", "voucher", "diskon", "discount", "potongan"}
+keywords_to_trigger_extraction = ['total', 'subtotal', 'tagihan', 'tunai', 
+                                  'invoice', 'rp', 'purchase', 
+                                  'harga', 'jumlah', 'bayar', 'receipt', 'faktur']
+
+
 
 def _preprocess_line_for_extraction(line: str) -> str:
     # Remove general noise characters, keep alphanumeric, spaces, commas, dots, slashes, hyphens, and PARENTHESES.
@@ -32,10 +35,6 @@ def _preprocess_line_for_extraction(line: str) -> str:
     cleaned_line = re.sub(r'(\d)\s*,\s*(\d)', r'\1,\2', cleaned_line)
     cleaned_line = re.sub(r'(\d)\s*\.\s*(\d)', r'\1.\2', cleaned_line)
     
-    # IMPORTANT: REMOVED the conditional merge `re.sub(r'(\d)\s+(?=\d{2,3}\b)', r'\1', cleaned_line)` here.
-    # This was causing concatenation of distinct price columns.
-    # Instead, `clean_digits_for_int` will be responsible for merging spaces *within* a single price block.
-    
     # Normalize multiple spaces to single space and strip
     cleaned_line = re.sub(r'\s+', ' ', cleaned_line).strip()
     return cleaned_line
@@ -43,13 +42,11 @@ def _preprocess_line_for_extraction(line: str) -> str:
 def clean_digits_for_int(price_str_candidate: str) -> Union[int, None]:
     if not price_str_candidate: return None
     # Remove any non-numeric/non-comma/non-dot/non-slash characters that might be OCR errors,
-    # This also removes spaces if they were passed in, as we now handle internal spaces in the line pre-processing.
     cleaned_str = price_str_candidate.replace(' ', '') # Ensure all spaces are gone for int conversion
     cleaned_str = re.sub(r'^RP\s*\.?\s*', '', cleaned_str, flags=re.IGNORECASE).strip()
     cleaned_str = cleaned_str.replace(':', '.') # Normalize colons to dots for decimals, if any
     
-    # NEW: Remove any remaining non-digit, non-comma, non-dot characters before final cleaning
-    # This targets characters like '•' or '\'' that might appear
+    # Remove any remaining non-digit, non-comma, non-dot characters before final cleaning
     cleaned_str = re.sub(r'[^\d.,]', '', cleaned_str) 
 
     just_digits = re.sub(r'[.,]', '', cleaned_str) # Remove commas and dots for integer conversion
@@ -62,16 +59,12 @@ def clean_digits_for_int(price_str_candidate: str) -> Union[int, None]:
 def extract_discount_info_from_line(line: str, discount_keywords: set) -> Union[Dict[str, Any], None]:
     line_lower = line.lower()
     
-    # Pre-process the line for better numeric parsing
-    # Important: Keep parentheses here as they are a primary indicator for discounts.
-    cleaned_line = line
+    cleaned_line = line_lower
     cleaned_line = re.sub(r'(\d)\s*,\s*(\d)', r'\1,\2', cleaned_line) # "X, YYY" -> "X,YYY"
     cleaned_line = re.sub(r'(\d)\s*\.\s*(\d)', r'\1.\2', cleaned_line) # "X. YYY" -> "X.YYY"
     cleaned_line = re.sub(r'[^\w\s.,\-()]', '', cleaned_line) # Keep alphanumeric, spaces, commas, dots, hyphens, and PARENTHESES. Fixed hyphen.
     cleaned_line = re.sub(r'\s+', ' ', cleaned_line).strip() # Normalize spaces
 
-    # --- Step 1: Check for explicit patterns (parentheses, negative sign) first ---
-    # These are strong indicators of a discount, regardless of keywords or surrounding text.
     match_paren = re.search(r'\(\s*([\d,.]+)\s*\)', cleaned_line)
     if match_paren:
         amount = clean_digits_for_int(match_paren.group(1))
@@ -86,11 +79,7 @@ def extract_discount_info_from_line(line: str, discount_keywords: set) -> Union[
             desc = cleaned_line[:match_negative.start()].strip() or "Discount"
             return {'text': desc.upper(), 'amount': amount, 'type': 'negative'}
 
-    # --- Step 2: Check for keyword-based discounts where AMOUNT IS DIRECTLY NEXT TO KEYWORD ---
-    # This is a stricter check. We require the keyword to be close to the amount.
     for keyword in discount_keywords:
-        # Pattern: keyword, optional colon/equal/hyphen, optional currency, then the amount
-        # Ensure the keyword is followed by a number.
         pattern = rf"{re.escape(keyword)}\s*[:=\-]?\s*(?:(?:RP|Rp)\.?\s*)?([\d,.]+)\b" # Added \b for word boundary after amount
         keyword_match_amount = re.search(pattern, cleaned_line, re.IGNORECASE)
         if keyword_match_amount:
@@ -99,9 +88,8 @@ def extract_discount_info_from_line(line: str, discount_keywords: set) -> Union[
                 desc = cleaned_line[:keyword_match_amount.start()].strip() or keyword.upper()
                 return {'text': desc.upper() or keyword.upper(), 'amount': amount, 'type': 'keyword'}
     
-    # --- IMPORTANT: The generic `trailing_numbers` logic has been REMOVED from here. ---
-    
-    return None # No discount found by any specific pattern
+
+    return None 
 
 def clean_name_general(name: str) -> str:
     if not name: return ""
@@ -115,16 +103,7 @@ def extract_name_and_price_from_line_v2(line: str) -> Tuple[Union[str, None], Un
     if not original_line:
         return None, None
 
-    # Apply general pre-processing to the line first
     processed_line = _preprocess_line_for_extraction(original_line)
-    
-    # --- NEW STRATEGY FOR PRICE EXTRACTION ---
-    # Find all potential numeric tokens that could be prices.
-    # This pattern captures sequences of digits, commas, dots, or slashes,
-    # potentially preceded by "RP" or "Rp" and ending at a word boundary.
-    # This will correctly identify "5,500" and "5,500" as two distinct tokens.
-    # This will correctly identify "10,900" and "7,500" as two distinct tokens.
-    # This should also handle "22,400" as one token.
     
     price_candidate_pattern = r'(?:RP|Rp\s*\.?\s*)?[\d.,/]+\b'
     all_potential_prices = re.findall(price_candidate_pattern, processed_line, re.IGNORECASE)
@@ -134,32 +113,21 @@ def extract_name_and_price_from_line_v2(line: str) -> Tuple[Union[str, None], Un
     price_val = None
 
     if all_potential_prices:
-        # Crucial step: Take the LAST extracted potential price.
-        # This is because receipts usually put the final total for an item in the rightmost column.
         raw_price_token = all_potential_prices[-1]
         
-        # Now, clean this raw token. clean_digits_for_int will handle spaces (if any exist due to OCR)
-        # and non-digit characters to convert to integer.
         price_val = clean_digits_for_int(raw_price_token)
         
-        # If a valid price was extracted, proceed to determine the name part.
         if price_val is not None:
-            # Reconstruct the name by finding the position of the raw_price_token
-            # (which is the last one) and taking everything before it.
-            # Using rsplit to split from the right, only once.
             name_candidate_raw = processed_line.rsplit(raw_price_token, 1)[0].strip()
             name_part = clean_name_general(name_candidate_raw)
             
-            # Apply final cleaning to the item name to remove any lingering numbers (like quantity)
             name_part = final_item_name_cleaning(name_part)
             
             return name_part if name_part else None, price_val
     
-    # Fallback: If no valid price was extracted, or price_val is None
-    # If the processed line still contains alphabetical characters, assume it's a name without a price.
     if any(char.isalpha() for char in processed_line): 
         name_part = clean_name_general(processed_line)
-    price_val = None # Ensure price is None if no valid price could be determined
+    price_val = None 
 
     return name_part if name_part else None, price_val
 
@@ -171,12 +139,9 @@ def extract_ocr_items_v2(text: str) -> Dict[str, Any]:
     while i < len(lines):
         current_line = lines[i]
         print(f"DEBUG v2 Processing line: '{current_line}'")
-
-        # Step 1: Attempt to extract a discount based on strong patterns (parentheses, negative sign, and KEYWORD-ASSOCIATED trailing numbers)
-        # Pass the ORIGINAL line to extract_discount_info_from_line for its internal robust pre-processing.
+        
         discount_info = extract_discount_info_from_line(current_line, RECEIPT_DISCOUNT_KEYWORDS)
         
-        # If a discount is found AND it has an amount, process it as a discount
         if discount_info and discount_info.get('amount') is not None:
             discount_amount = discount_info['amount']
             print(f"DEBUG v2: Found discount: {discount_amount} from line '{current_line}' (type: {discount_info.get('type')})")
@@ -190,21 +155,18 @@ def extract_ocr_items_v2(text: str) -> Dict[str, Any]:
             else:
                 print(f"DEBUG v2: Warning - Found discount '{current_line}' but no previous item to apply it to.")
             i += 1
-            continue # Move to next line if discount processed
+            continue 
 
-        # Step 2: If it wasn't a discount, then attempt to extract an item (name and price)
-        # Pass the ORIGINAL line to extract_name_and_price_from_line_v2, which now handles its own robust pre-processing.
         name, price_on_line = extract_name_and_price_from_line_v2(current_line) 
         print(f"DEBUG v2: extract_name_and_price_from_line_v2('{current_line}') -> name='{name}', price='{price_on_line}'")
         
         if name and price_on_line is not None:
             items.append({"item_name": name, "price": price_on_line})
             
-        # Step 3: If it's neither a clear item nor a discount, log and move on
         elif name and price_on_line is None: 
             print(f"DEBUG v2: Line with name but no price, skipping as main item (could be desc/header): '{name}'")
         
-        else: # Neither item nor discount was recognized
+        else: 
             print(f"DEBUG v2: Line did not yield name/price or was discarded: '{current_line}'")
 
         i += 1
@@ -318,58 +280,40 @@ def parse_invoice_lines_from_text(invoice_text_lines: List[str]) -> List[Dict]:
                 parsed_items.append({"item_name": name_part.upper(), "price": price_val}) # Nama sudah di .title() oleh extract_name_and_price_from_line_v2
     return parsed_items
 
-# --- FUNGSI PEMBERSIH NAMA ITEM YANG TELAH DIPERBARUI ---
 def final_item_name_cleaning(item_name: str) -> str:
-    """
-    Membersihkan nama item dengan menghapus pola angka dan teks di akhir string yang
-    kemungkinan merupakan sisa dari harga, kuantitas, atau format invoice.
-
-    Args:
-        item_name: Nama item asli.
-
-    Returns:
-        Nama item yang sudah dibersihkan.
-    """
     if not item_name:
         return ""
 
-    # Pola 0 (BARU): Menghapus pola spesifik dari invoice.
-    # Contoh: "KAOS RP 100000 1 RP" -> "KAOS"
-    # Pola ini mencari " RP <harga> <kuantitas> RP" di akhir string.
-    # Menggunakan re.IGNORECASE untuk menangani "RP" atau "rp".
     cleaned = re.sub(r'\s+RP\s+\d+\s+\d+\s+RP$', '', item_name, flags=re.IGNORECASE).strip()
     if cleaned != item_name:
         return cleaned
-
-    # Pola 1: Menghapus "<spasi><1-2 digit><spasi><3+ digit>" dari akhir.
+        
     # Contoh: "Idm Tas Rmh Lngk Kcl 1 3100" -> "Idm Tas Rmh Lngk Kcl"
     cleaned = re.sub(r'\s+\d{1,2}\s+\d{3,}$', '', item_name).strip()
     if cleaned != item_name:
         return cleaned
 
-    # Pola 2: Menghapus "<spasi><3+ digit>" dari akhir.
     # Contoh: "Some Item 45000" -> "Some Item"
     cleaned = re.sub(r'\s+\d{3,}$', '', item_name).strip()
     if cleaned != item_name:
         return cleaned
-        
-    # Pola 3: Menghapus kuantitas "<spasi><1-2 digit>" dari akhir.
+    
     # Contoh: "Bambi Baby Powder 1" -> "Bambi Baby Powder"
     match = re.match(r'^(.*[a-zA-Z].*)\s(\d{1,2})$', item_name)
     if match:
         return match.group(1).strip()
 
-    return item_name # Kembalikan nama asli jika tidak ada pola yang cocok
+    return item_name
 
 
 def process_data_custom(
     parsed_items_list: List[Dict], 
-    all_rec_texts_from_ocr: List[str],
+    total_tax_final: float,
     is_receipt_logic: bool = True 
 ) -> Dict:
     valid_items_final = []
     print(f"DEBUG process_data_custom: Input items = {parsed_items_list}")
-    print(f"DEBUG process_data_custom: is_receipt_logic = {is_receipt_logic}") # pre_calculated_tax dihapus dari debug print
+    print(f"DEBUG process_data_custom: is_receipt_logic = {is_receipt_logic}")
     unique_items_tracker = set()
 
     for item_data in parsed_items_list:
@@ -377,15 +321,13 @@ def process_data_custom(
         price = item_data.get('price')
         if not item_name_original or price is None: continue
         
-        # Terapkan pembersihan akhir pada nama item
         item_name_final = final_item_name_cleaning(item_name_original)
         
         min_len = 2
         if len(item_name_final) < min_len: continue
-        # Logika untuk 'vc' sebagai item diskon khusus tetap dipertahankan jika diperlukan
         if item_name_final.isdigit() and not (item_name_final.lower() == "vc" and is_receipt_logic) : continue
         if old_is_noise(item_name_final) and not (item_name_final.lower() == "vc" and is_receipt_logic): continue
-        if price < 0: price = 0 # Harga tidak boleh negatif
+        if price < 0: price = 0 
 
         item_signature = (item_name_final.lower(), price)
         if item_signature in unique_items_tracker:
@@ -394,29 +336,10 @@ def process_data_custom(
         unique_items_tracker.add(item_signature)
         valid_items_final.append({'item_name': item_name_final, 'price': price})
     
-    # Logika untuk pajak diubah: hanya ada ekstraksi otomatis
-    total_tax_final = 0 # Default ke 0 jika tidak ditemukan
-    print(f"DEBUG process_data_custom: Calculating tax using extract_tax_lines_with_context on global OCR text.")
-    _, tax_amounts_detected = extract_tax_lines_with_context(all_rec_texts_from_ocr, list(TAX_KEYWORDS))
-    
-    # Jika ada pajak yang terdeteksi, jumlahkan. Jika tidak ada, total_tax_final tetap 0.
-    if tax_amounts_detected:
-        total_tax_final = sum(tax_amounts_detected)
-        print(f"DEBUG process_data_custom: Calculated tax from global text: {total_tax_final}")
-    else:
-        # Jika tidak ada pajak yang terdeteksi dan Anda ingin itu NULL/None,
-        # bisa diatur di sini, namun untuk hasil JSON biasanya int 0 lebih aman.
-        # Jika Anda benar-benar ingin None, ubah total_tax_final = None
-        print(f"DEBUG process_data_custom: No tax detected from global text. Setting to 0 (or None if desired).")
-
     final_result_json = {'status': 'success', 'tax': total_tax_final, 'items': valid_items_final }
     
-    # Status detail disesuaikan berdasarkan hasil ekstraksi item dan pajak
-    if not valid_items_final and total_tax_final == 0:
-        final_result_json['status_detail'] = 'no_valid_items_or_tax_finalized'
-    elif not valid_items_final:
+    if not valid_items_final:
         final_result_json['status_detail'] = 'no_valid_items_finalized'
-    # Tidak perlu kondisi khusus untuk pajak jika total_tax_final sudah 0 secara default.
 
     return final_result_json
 
@@ -435,10 +358,6 @@ def call_ocr_space_api(image_bytes: bytes, api_key: str, language: str = 'eng',
     except Exception as e:
         print(f"ERROR in call_ocr_space_api: {e}")
         return None if return_full_json else ""
-
-keywords_to_trigger_extraction = ['total', 'subtotal', 'tagihan', 'tunai', 'kembali', 'indomaret', 'alfamart', 
-                                  'invoice', 'kepada', 'rp', 'penjaringan', 'purchase', 'pasta', 'kemang', 
-                                  'table #', 'harga', 'jumlah', 'bayar', 'bill', 'receipt', 'faktur']
 
 def read_image(image_np: np.ndarray, api_key: str):
     image_for_ocr_global_np = preprocess_for_ocr(image_np.copy())
@@ -513,14 +432,27 @@ def read_image(image_np: np.ndarray, api_key: str):
             items_to_be_custom_processed = extracted_receipt_data.get("items", [])
             status_from_extraction = extracted_receipt_data.get("status", "error_unknown")
 
+
     if not items_to_be_custom_processed and status_from_extraction not in ["success", "no_items_extracted"]:
         message = f"Extraction failed or yielded no items. Status: {status_from_extraction}"
         if is_likely_invoice and not items_to_be_custom_processed: message = "No items could be extracted from the invoice."
         print(f"DEBUG read_image: Tidak ada item untuk process_data_custom. Pesan: {message}")
     
+        total_tax_final = 0 
+
+    print(f"DEBUG process_data_custom: extract_tax_lines_with_context on global OCR text.")
+    _, tax_amounts_detected = extract_tax_lines_with_context(rec_texts_global_lines, list(TAX_KEYWORDS))
+    
+    if tax_amounts_detected:
+        total_tax_final = sum(tax_amounts_detected)
+        print(f"DEBUG process_data_custom: Calculated tax from global text: {total_tax_final}")
+    else:
+        print(f"DEBUG process_data_custom: No tax detected from global text. Setting to 0 (or None if desired).")
+
+
     final_structured_result = process_data_custom(
         items_to_be_custom_processed,
-        rec_texts_global_lines, 
+        total_tax_final, 
         is_receipt_logic=final_processing_as_receipt_flag
     )
 
