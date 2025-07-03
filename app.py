@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, url_for
+from flask import Flask, request, jsonify
 from PIL import Image
 import numpy as np
 from io import BytesIO
@@ -26,7 +26,7 @@ db = SQLAlchemy(app)
 
 class ScanLog(db.Model):
     __tablename__ = 'scan'
-    __table_args__ = {'schema': 'log'}
+    __table_args__ = {'schema': 'public'}
 
     id = db.Column(db.Integer, primary_key=True)
     image = db.Column(db.Text, nullable=False) 
@@ -72,10 +72,10 @@ def predict():
         db.session.add(new_log)
         db.session.commit()
 
-        # image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename).replace(os.sep, '/')
+        image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename).replace(os.sep, '/')
 
         response_data = result
-        # response_data['image'] = image_path
+        response_data['image'] = image_path
 
         return jsonify(response_data), 200
     except Exception as e:
