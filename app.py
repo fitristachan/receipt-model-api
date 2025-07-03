@@ -72,9 +72,10 @@ def predict():
         db.session.add(new_log)
         db.session.commit()
 
-        image_url = url_for('get_image', log_id=new_log.id, _external=True)
+        image_path = os.path.join(app.config['UPLOAD_FOLDER'], filename).replace(os.sep, '/')
+
         response_data = result
-        response_data['image_url'] = image_url
+        response_data['image'] = image_path
 
         return jsonify(response_data), 200
     except Exception as e:
