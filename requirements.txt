@@ -5,3 +5,5 @@ ultralytics
 pillow
 # paddleocr==3.0.0
 requests
+Flask-SQLAlchemy 
+psycopg2-binary
